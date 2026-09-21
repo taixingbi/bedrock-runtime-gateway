@@ -24,6 +24,12 @@ variable "caller_security_group_id" {
   type        = string
 }
 
+variable "control_plane_caller_security_group_id" {
+  description = "Phase 4 (2026-09-21, \"direct cutover\"): platform-control-plane's backend_service task SG, also allowed to call this ALB directly. Nullable/optional so environments without that backend live yet (prod today) don't need to pass it."
+  type        = string
+  default     = null
+}
+
 variable "image" {
   type = string
 }

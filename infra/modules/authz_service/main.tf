@@ -35,6 +35,22 @@ resource "aws_security_group" "alb" {
     security_groups = [var.caller_security_group_id]
   }
 
+  # Phase 4 (2026-09-21, "direct cutover"): platform-control-plane's
+  # backend_service also calls authz-service directly now (same
+  # mTLS-verified path as gateway-api). Optional/nullable so
+  # environments without that backend live yet (prod today) don't
+  # need to pass it.
+  dynamic "ingress" {
+    for_each = var.control_plane_caller_security_group_id != null ? [var.control_plane_caller_security_group_id] : []
+    content {
+      description     = "From control-plane backend, HTTPS only"
+      from_port       = 443
+      to_port         = 443
+      protocol        = "tcp"
+      security_groups = [ingress.value]
+    }
+  }
+
   egress {
     from_port   = 0
     to_port     = 0

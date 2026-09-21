@@ -95,8 +95,13 @@ module "ecs_service" {
   vpc_link_security_group_id = data.aws_security_group.api_gateway_vpc_link.id
   log_group_name             = "/ai-platform/ecs/bedrock-gateway-dev"
   # Plan section 35.5 -- same shared internal Private CA
-  # platform-authz-service's own ALB HTTPS listener uses.
-  private_ca_arn = aws_acmpca_certificate_authority_certificate.internal.certificate_authority_arn
+  # platform-authz-service's own ALB HTTPS listener uses. Hardcoded,
+  # not a resource reference: the CA moved to platform-foundation
+  # (Phase 3c, 2026-09-21) -- same convention platform-authz-service's
+  # own local.private_ca_arn already used before this move (ACM PCA
+  # has no clean "look up by name" data source). Update this if the CA
+  # is ever destroyed and recreated (a new one gets a new ARN).
+  private_ca_arn = "arn:aws:acm-pca:us-east-1:646821141010:certificate-authority/328ba585-7400-4565-bad3-6bfda5c0196d"
   sns_topic_arn  = aws_sns_topic.ops_alerts.arn
 
   # No image has been pushed on a first apply -- CI registers the real
@@ -158,8 +163,9 @@ module "ecs_service" {
 
     # M12 (plan.md Section 5): delegates AWS_IAM principal mapping to
     # authz-service instead of resolving it in-process. HTTPS via a
-    # private-CA-issued cert (see aws_acmpca_certificate_authority.
-    # internal above) -- this is an internal call between two ECS tasks
+    # private-CA-issued cert (see platform-foundation's
+    # aws_acmpca_certificate_authority.internal) -- this is an internal
+    # call between two ECS tasks
     # in the same VPC (platform-authz-service's own ALB is
     # `internal = true` and its security group only accepts traffic
     # from this service's own task SG, looked up above), but encrypted
@@ -169,7 +175,35 @@ module "ecs_service" {
     # HttpIamTenantResolver trusts exactly this CA (not the system
     # trust store) since it's privately issued -- see
     # auth/aws_iam.py's HttpIamTenantResolver and config.py.
-    AUTHZ_CA_CERT_PEM = aws_acmpca_certificate.internal_root.certificate
+    #
+    # Hardcoded, not a resource reference: the CA moved to
+    # platform-foundation (Phase 3c, 2026-09-21). A root CA's
+    # self-signed certificate doesn't change for the CA's lifetime, so
+    # this is stable -- update this (fetch fresh via `aws acm-pca
+    # get-certificate-authority-certificate`) if the CA is ever
+    # destroyed and recreated.
+    AUTHZ_CA_CERT_PEM = chomp(<<-EOT
+      -----BEGIN CERTIFICATE-----
+      MIIDKzCCAhOgAwIBAgIRAJI2amN73dXcl32YjkCVK5swDQYJKoZIhvcNAQELBQAw
+      LzEtMCsGA1UEAwwkQmVkcm9jayBHYXRld2F5IFBsYXRmb3JtIEludGVybmFsIENB
+      MB4XDTI2MDkxNzAxNDMyNVoXDTM2MDkxNzAyNDMyNVowLzEtMCsGA1UEAwwkQmVk
+      cm9jayBHYXRld2F5IFBsYXRmb3JtIEludGVybmFsIENBMIIBIjANBgkqhkiG9w0B
+      AQEFAAOCAQ8AMIIBCgKCAQEAop+Y1RxTXoOTZVrIgFurEINkEbE/E1/JQjHesTMX
+      2zuFmgQAJtmsLRHnEpJDPRSWjcbdZCVbhSsfNGt7gNXIw32pPTbPOx02BoHUVaFS
+      MbNaw6t0TRvsuWTCrJCTRIoS595xrUSz1jFuwIMgpzJH7C0u6OoMEI+YrU6WYOhX
+      pKsT5AQrVf7e6BaRX4IeyOZRK8A7ACq0NqrgVDv+gmq8ggnAWZyMBsSscozkOfZO
+      FK+fnsK2xdSiDvvoBOiN2wC3zx6ZyTqzN0zsAaqq9hQby3y2GD/FDyIq4MIYSsqR
+      YlhWJp5HL+BVnJ66sn9MqnKbNUEM3EI71DVX5wzGzvpCUwIDAQABo0IwQDAPBgNV
+      HRMBAf8EBTADAQH/MB0GA1UdDgQWBBREKqAldQXFXQVILzNgPFMgmKAHMDAOBgNV
+      HQ8BAf8EBAMCAYYwDQYJKoZIhvcNAQELBQADggEBAHnic2MRaOxmzBWU4/A1hYmq
+      tdipEjk2BXt3uOUOkbiPn3lYneZCcQIUfSrDP65d+3+5aTPV2oVGU93zc+YrUwjN
+      QSQWYP0QrXWBa2ZOAou354Jg5je1ydVRZi2QdnIuIEkHdbkY10zAy8b4ojc75tDE
+      vmJoVAJhXQnjiLl0NeR0rPY4cTdPKnZ+Wphb2cl8hEGzYr6s7TMQvbPjzB0HrnFX
+      OTDWYTh2wY7wKxcWzp1rlgul/jH1Kek4eBtG3u3F/2R8MBxYfI5XzOyoWayzXVd5
+      LrdHmzHQfP2eEv9GqS54Gqu3elV3dOdluK0rbmYfrUcVGOoFI3DFBFLD01agWe0=
+      -----END CERTIFICATE-----
+    EOT
+    )
 
     # Tracing: the ADOT sidecar (modules/ecs_service) listens on
     # localhost within this same task (awsvpc mode -- one network
@@ -669,65 +703,15 @@ resource "aws_dynamodb_table" "provisioned_tenant_policies_history" {
 # --- M12: Authorization Service (plan.md Section 5) -------------------
 #
 # Plan section 36: authz_service's own ECS/ALB/ECR Terraform moved to
-# platform-authz-service -- see its environments/dev/main.tf. Only the
-# genuinely shared resources this repo alone owns stay here: the
-# private CA below (authz-service's ALB cert is issued from it, but so
-# could any other internal service's be), the ops_alerts SNS topic,
-# and the provisioned_principal_mappings table (written by this repo's
-# own onboarding flow -- see platform-control-plane once THAT
-# migration lands -- read by authz-service).
-
-# --- Internal TLS: gateway-api <-> authz-service ---------------------------
-#
-# Real recurring cost: AWS Private CA bills ~$400/month regardless of
-# usage, on top of the ALB itself. Created here (dev only, not
-# environments/global) since only dev is live -- if/when prod is
-# applied, either share this CA (a data-source lookup by ARN, same
-# convention api_gateway_vpc_link already uses for cross-environment
-# coupling) or accept a second $400/mo CA for prod's own isolation.
-#
-# Standard HashiCorp-documented bootstrap for a self-signed private
-# root CA: create the CA, self-sign its own CSR, then import that
-# signature back to activate it. aws_acm_certificate.this (in
-# modules/authz_service) is issued straight from this CA -- no DNS/
-# email domain validation needed (unlike a public ACM cert), since a
-# private CA is trusted because IT signed it, not because you proved
-# domain ownership.
-resource "aws_acmpca_certificate_authority" "internal" {
-  type = "ROOT"
-
-  certificate_authority_configuration {
-    key_algorithm     = "RSA_2048"
-    signing_algorithm = "SHA256WITHRSA"
-
-    subject {
-      common_name = "Bedrock Gateway Platform Internal CA"
-    }
-  }
-
-  # Minimum allowed -- no benefit to a longer grace period for
-  # infrastructure like this, and every extra day is another day of
-  # possible billing on a CA nobody meant to keep.
-  permanent_deletion_time_in_days = 7
-}
-
-resource "aws_acmpca_certificate" "internal_root" {
-  certificate_authority_arn   = aws_acmpca_certificate_authority.internal.arn
-  certificate_signing_request = aws_acmpca_certificate_authority.internal.certificate_signing_request
-  signing_algorithm           = "SHA256WITHRSA"
-  template_arn                = "arn:aws:acm-pca:::template/RootCACertificate/V1"
-
-  validity {
-    type  = "YEARS"
-    value = 10
-  }
-}
-
-resource "aws_acmpca_certificate_authority_certificate" "internal" {
-  certificate_authority_arn = aws_acmpca_certificate_authority.internal.arn
-  certificate               = aws_acmpca_certificate.internal_root.certificate
-  certificate_chain         = aws_acmpca_certificate.internal_root.certificate_chain
-}
+# platform-authz-service -- see its environments/dev/main.tf. The
+# genuinely shared resources this repo used to alone-own here (the
+# private CA authz-service's ALB cert is issued from -- but so could
+# any other internal service's be) moved to platform-foundation in
+# turn (Phase 3c, 2026-09-21, see that repo's environments/dev/main.tf).
+# What's left here: the ops_alerts SNS topic, and the
+# provisioned_principal_mappings table (written by this repo's own
+# onboarding flow -- see platform-control-plane once THAT migration
+# lands -- read by authz-service).
 
 module "worker_service" {
   source = "../../modules/worker_service"

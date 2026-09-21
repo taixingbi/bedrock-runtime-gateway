@@ -60,11 +60,6 @@ class Settings:
     oidc_jwks_cache_ttl_s: float
     dev_jwt_keypair_path: str
     chat_required_role: str
-    admin_required_role: str
-    # M13/plan section 30: tenant-scoped admin tier, distinct from
-    # admin_required_role's global override -- see auth/rbac.py's
-    # require_tenant_match_or_role().
-    manager_required_role: str
     iam_tenants_path: str  # AWS_IAM/SigV4 auth path -- see auth/aws_iam.py
     # Plan section 34.2: real enterprise IdP (Okta/Entra ID) `groups`
     # claim -> tenant_id/application_id/roles. Empty means no mapping
@@ -226,8 +221,6 @@ def load_settings() -> Settings:
         oidc_jwks_cache_ttl_s=_env_float("OIDC_JWKS_CACHE_TTL_S", 300.0),
         dev_jwt_keypair_path=os.environ.get("DEV_JWT_KEYPAIR_PATH", ".dev/jwt_keypair.json"),
         chat_required_role=os.environ.get("CHAT_REQUIRED_ROLE", "developer"),
-        admin_required_role=os.environ.get("ADMIN_REQUIRED_ROLE", "platform_admin"),
-        manager_required_role=os.environ.get("MANAGER_REQUIRED_ROLE", "manager"),
         iam_tenants_path=os.environ.get("IAM_TENANTS_PATH", "policies/iam_tenants.yaml"),
         enterprise_groups_path=os.environ.get("ENTERPRISE_GROUPS_PATH", ""),
         tenant_policy_path=os.environ.get("TENANT_POLICY_PATH", "policies/tenants.yaml"),

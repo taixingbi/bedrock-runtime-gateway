@@ -15,9 +15,9 @@ below covers everything real since then.
 - **M7** — async jobs (SQS-style queue + worker + store), `api/jobs_routes.py`.
 - **M8** — FinOps: per-tenant/per-application budgets and usage/cost tracking (`usage/store.py`).
 - **M9** — model lifecycle/certification gate (`routing/certification.py`, `policies/certified_models.yaml`).
-- **M11** — self-service application onboarding: submit → approve/reject → inline provisioning, no Terraform/redeploy (`onboarding/*`, `api/onboarding_routes.py`).
+- **M11** — self-service application onboarding: submit → approve/reject → inline provisioning, no Terraform/redeploy. Originally built here (`onboarding/*`, `api/onboarding_routes.py`); that HTTP surface moved to `platform-control-plane`'s own backend once its Terraform went live (2026-09-21) and was deleted from this repo -- the `provisioned_tenant_policies`/`provisioned_principal_mappings` DynamoDB tables it writes to are still read by this repo's own `Layered*` stores on every live request, see `main.py`.
 - **M12** — delegates AWS_IAM principal resolution and (since plan 35.16) resource/context-aware authorization to `platform-authz-service`'s real PDP over HTTP, when `AUTHZ_SERVICE_URL` is configured (`auth/aws_iam.py`'s `HttpIamTenantResolver`).
-- **Plan section 33** — tenant policy versioning: propose → approve/reject → apply, with a DynamoDB history table backing rollback (`policy/change_requests.py`); the portal has a full UI for this.
+- **Plan section 33** — tenant policy versioning: propose → approve/reject → apply, with a DynamoDB history table backing rollback. The propose/approve/reject HTTP surface moved to `platform-control-plane`'s own backend along with M11's (`policy/change_requests.py` deleted from this repo); the portal has a full UI for this. Store-level versioning (`InMemoryPolicyStore.apply_change`/`rollback`/`list_history`) stays here and is still exercised by this repo's own tests (`test_policy_versioning.py`).
 - **Plan section 34** — enterprise IdP group→tenant/role mapping (`auth/enterprise_groups.py`), PDP-style structured authorization decisions with a `decision_id` threaded into every audit event (`authz/decision.py`), a model governance registry with data-classification enforcement (`routing/model_registry.py`), a unified admission-control decision (kill switch + rate limit + budget as one), and cost governance.
 - **Plan sections 35 (P0–P2 production hardening)** — private-subnet networking, ECS autoscaling, a real cross-service PDP call carrying resolved model/resource/data-classification (not just identity), distributed (DynamoDB-backed) concurrency limiting and rate limiting with a TTL'd lease design (self-healing after a crashed task), fail-closed model governance and authz defaults for prod, CI security scanning (CodeQL, pip-audit, Trivy), and more — see `plan.md` in the platform root for the full list.
 
@@ -90,18 +90,17 @@ that actually verifies SigV4 and injects the identity headers this app
 trusts.
 
 Tenant policy lives in `policies/tenants.yaml` (state, model allowlist,
-rate limit, guardrail policy, route set — see M2 below). To flip a
-tenant's state at runtime (the kill switch) without restarting the
-server:
-
-```bash
-ADMIN_TOKEN=$(python scripts/generate_dev_token.py -q --tenant-id platform --roles platform_admin)
-
-curl -s -X PUT http://localhost:8080/v1/admin/tenants/finance/state \
-  -H "authorization: Bearer $ADMIN_TOKEN" \
-  -H 'content-type: application/json' \
-  -d '{"state": "SUSPENDED"}'
-```
+rate limit, guardrail policy, route set — see M2 below). Flipping a
+tenant's state at runtime (the kill switch) is now done through
+`platform-control-plane`'s own admin API/portal, not this repo — that
+service's writes land in the same `provisioned-tenant-policies`
+DynamoDB table this app's own `LayeredPolicyStore` reads from on every
+live request (see `main.py`'s `policy_store_primary`), so the change
+still takes effect here immediately via push invalidation, just
+without this app exposing the write endpoint itself anymore. For pure
+local dev without a real DynamoDB table configured, editing
+`policies/tenants.yaml` directly and restarting the server (or waiting
+out `policy_cache_ttl_s`) works the same as before.
 
 For an SSE stream instead of a single JSON response, pass `"stream": true`:
 
@@ -196,26 +195,27 @@ repo's own infra/ half provisions. See `.github/workflows/app-ci.yml`.
 
 ```
 services/gateway/
-  api/          # request/response schemas + route handlers: routes.py (chat), admin_routes.py,
-                # jobs_routes.py (M7), onboarding_routes.py (M11)
+  api/          # request/response schemas + route handlers: routes.py (chat), jobs_routes.py (M7).
+                # admin_routes.py/onboarding_routes.py (M11/plan 33's admin+onboarding HTTP surface)
+                # moved to platform-control-plane's own backend (2026-09-21) and were deleted here.
   auth/         # JWT + AWS_IAM verification, identity, RBAC (M1); enterprise_groups.py resolves
                 # an IdP groups claim to tenant/role (plan 34.2); aws_iam.py optionally delegates
                 # both identity AND resource-level authorization to platform-authz-service (M12,
                 # plan 35.16)
   authz/        # decision.py -- PDP-style structured Decision (allow/reason/decision_id/
                 # policy_version) wrapping rbac.py's checks for uniform audit logging (plan 34.3)
-  policy/       # tenant policy model/store/cache, rate limiter (M2); change_requests.py --
-                # propose/approve/reject/rollback for a provisioned tenant's policy (plan 33);
-                # validation.py, DynamoDbPolicyStore/DynamoDbRateLimiter (real cross-instance
-                # coordination, plan 35.2)
+  policy/       # tenant policy model/store/cache, rate limiter (M2); validation.py,
+                # DynamoDbPolicyStore/DynamoDbRateLimiter (real cross-instance coordination, plan
+                # 35.2). change_requests.py (propose/approve/reject/rollback HTTP surface, plan 33)
+                # moved to platform-control-plane's own backend and was deleted here -- store-level
+                # apply_change()/rollback()/list_history() stay, still exercised by
+                # tests/test_policy_versioning.py.
   guardrails/   # GuardrailClient seam, basic regex impl, fail-closed enforcement (M3)
   cache/        # policy-aware response cache: key derivation + in-memory store (M4)
   routing/      # circuit breaker + certified router with fallback (M4); model_registry.py --
                 # governance overlay (status/owner/max_data_classification), certification.py (M9)
   inference/    # Bedrock Converse client (retry/backoff + streaming, no boto3 at import time)
   jobs/         # SQS-style queue + worker + store for async job submission (M7)
-  onboarding/   # self-service application onboarding: request, approve/reject, inline
-                # provisioning of a principal mapping + tenant policy (M11)
   usage/        # per-tenant/per-application spend tracking, feeds the portal's Usage page (M8)
   concurrency.py  # BlockingCallRunner (bounded thread offload) + ConcurrencyLimiter /
                   # DynamoDbConcurrencyLimiter (fast-reject semaphore, TTL-leased + self-healing

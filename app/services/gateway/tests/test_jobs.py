@@ -2,12 +2,15 @@ import unittest
 
 from starlette.testclient import TestClient
 
+from ..auth.aws_iam import HEADER_ACCOUNT_ID, HEADER_PRINCIPAL_ARN, IamPrincipalGrant
 from ..config import load_settings
 from ..jobs.queue import InMemoryJobQueue
 from ..jobs.store import InMemoryJobStore
 from ..main import create_app
 from .auth_fixtures import auth_header, get_auth_fixture
 from .fakes import FakeConverseClient
+
+_KNOWN_ARN = "arn:aws:iam::646821141010:role/team-a-ai-client"
 
 
 def _client():
@@ -97,6 +100,71 @@ class JobsEndpointTests(unittest.TestCase):
 
         self.assertEqual(resp.status_code, 401)
         self.assertEqual(job_queue.sent, [])
+
+
+class _FakeIamResolverWithResourceAuthz:
+    """Combines FileIamTenantResolver's `resolve()` Protocol with
+    HttpIamTenantResolver's `check_resource_access()` (duck-typed, see
+    pipeline.enforce_resource_authorization's docstring) -- records
+    every call so a test can assert exactly what request_id/session_id
+    actually reached it. Standing in for both in one fake since a real
+    HttpIamTenantResolver would do both over the wire to the same
+    platform-authz-service call."""
+
+    def __init__(self, grant: IamPrincipalGrant):
+        self._grant = grant
+        self.resource_authz_calls = []
+
+    def resolve(self, principal_arn: str, *, request_id=None, session_id=None) -> IamPrincipalGrant:
+        return self._grant
+
+    def check_resource_access(self, principal_arn, **kwargs):
+        self.resource_authz_calls.append(kwargs)
+        from ..auth.aws_iam import ResourceAuthzDecision
+
+        return ResourceAuthzDecision(allow=True, policy_id="p", policy_version=1, reason="ok")
+
+
+class JobsSessionIdPropagationTests(unittest.TestCase):
+    """Regression test: submit_job()/get_job() used to build their own
+    Identity via _authenticate(request) without threading request_id/
+    session_id through (unlike routes.py's /v1/chat handler, which
+    always has) -- silent drift, not a crash, since both are optional
+    everywhere they're read. Caught during a repo-wide cleanup pass;
+    this locks the fix in so it can't quietly regress again."""
+
+    def _client(self):
+        settings = load_settings()
+        fixture = get_auth_fixture()
+        resolver = _FakeIamResolverWithResourceAuthz(
+            IamPrincipalGrant(tenant_id="team-a", application_id="team-a-ai-client", roles=["developer"])
+        )
+        app = create_app(
+            settings=settings,
+            converse_client=FakeConverseClient(),
+            token_verifier=fixture.verifier,
+            iam_tenant_resolver=resolver,
+            job_store=InMemoryJobStore(),
+            job_queue=InMemoryJobQueue(),
+        )
+        return TestClient(app), resolver
+
+    def test_submit_job_forwards_session_id_to_resource_authorization(self):
+        client, resolver = self._client()
+
+        resp = client.post(
+            "/v1/jobs",
+            json={"messages": [{"role": "user", "content": "hi"}]},
+            headers={
+                HEADER_PRINCIPAL_ARN: _KNOWN_ARN,
+                HEADER_ACCOUNT_ID: "646821141010",
+                "x-session-id": "sess-abc-123",
+            },
+        )
+
+        self.assertEqual(resp.status_code, 202)
+        self.assertEqual(len(resolver.resource_authz_calls), 1)
+        self.assertEqual(resolver.resource_authz_calls[0]["session_id"], "sess-abc-123")
 
 
 if __name__ == "__main__":

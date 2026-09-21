@@ -56,22 +56,25 @@ def build_jobs_router(
 ) -> APIRouter:
     api_router = APIRouter()
 
-    def _authenticate(request: Request):
+    def _authenticate(request: Request, *, request_id: str, session_id: Optional[str]):
         return pipeline.authenticate(
             request.headers.get("authorization"),
             token_verifier=token_verifier,
             iam_principal_arn=request.headers.get(aws_iam.HEADER_PRINCIPAL_ARN),
             iam_account_id=request.headers.get(aws_iam.HEADER_ACCOUNT_ID),
             iam_tenant_resolver=iam_tenant_resolver,
+            request_id=request_id,
+            session_id=session_id or None,
             enterprise_group_resolver=enterprise_group_resolver,
         )
 
     @api_router.post("/v1/jobs", status_code=202, response_model=JobResponse)
     async def submit_job(request: Request, job_request: JobRequest) -> JSONResponse:
         request_id = getattr(request.state, "request_id", str(uuid.uuid4()))
+        session_id = getattr(request.state, "session_id", "")
 
         try:
-            identity = _authenticate(request)
+            identity = _authenticate(request, request_id=request_id, session_id=session_id)
             pipeline.authorize(identity, required_role=settings.chat_required_role)
             policy = pipeline.resolve_policy(identity, policy_cache=policy_cache)
         except pipeline.PipelineError as exc:
@@ -118,6 +121,7 @@ def build_jobs_router(
                 if policy.data_classification
                 else {},
                 iam_tenant_resolver=iam_tenant_resolver, request_id=request_id,
+                session_id=session_id or None,
             )
         except pipeline.PipelineError as exc:
             return _error(exc.status_code, exc.code, str(exc), request_id)
@@ -161,9 +165,10 @@ def build_jobs_router(
     @api_router.get("/v1/jobs/{job_id}", response_model=JobStatusResponse)
     async def get_job(job_id: str, request: Request) -> JSONResponse:
         request_id = getattr(request.state, "request_id", str(uuid.uuid4()))
+        session_id = getattr(request.state, "session_id", "")
 
         try:
-            identity = _authenticate(request)
+            identity = _authenticate(request, request_id=request_id, session_id=session_id)
             pipeline.authorize(identity, required_role=settings.chat_required_role)
         except pipeline.PipelineError as exc:
             return _error(exc.status_code, exc.code, str(exc), request_id)

@@ -30,6 +30,7 @@ from services.gateway.auth.devkeys import generate_dev_keypair, mint_dev_token
 from services.gateway.auth.jwt_verifier import StaticKeyVerifier
 from services.gateway.config import load_settings
 from services.gateway.main import create_app
+from services.gateway.policy.cache import PolicySnapshotCache
 from services.gateway.policy.models import TenantPolicy, TenantState
 from services.gateway.policy.store import InMemoryPolicyStore
 from services.gateway.tests.otel_fixtures import make_test_tracer
@@ -42,6 +43,7 @@ AUDIENCE = "bedrock-gateway"
 class ScenarioApp:
     client: httpx.AsyncClient
     policy_store: InMemoryPolicyStore
+    policy_cache: PolicySnapshotCache
     private_key_pem: str
 
     def token(self, *, tenant_id: str, roles: Optional[List[str]] = None, sub: str = "load-test-user") -> str:
@@ -52,9 +54,6 @@ class ScenarioApp:
 
     def auth_header(self, *, tenant_id: str, roles: Optional[List[str]] = None) -> Dict[str, str]:
         return {"authorization": f"Bearer {self.token(tenant_id=tenant_id, roles=roles)}"}
-
-    def admin_header(self) -> Dict[str, str]:
-        return self.auth_header(tenant_id="platform", roles=["platform_admin"])
 
     async def aclose(self) -> None:
         await self.client.aclose()
@@ -73,18 +72,20 @@ def build_scenario_app(
     tracer, _exporter = make_test_tracer()  # quiet -- no console span spam during a load run
 
     settings = load_settings()
+    policy_cache = PolicySnapshotCache(store=policy_store, ttl_s=settings.policy_cache_ttl_s)
     app = create_app(
         settings=settings,
         converse_client=converse_client,
         token_verifier=verifier,
         policy_store=policy_store,
+        policy_cache=policy_cache,
         guardrail_client=guardrail_client,
         tracer=tracer,
         **create_app_kwargs,
     )
     transport = httpx.ASGITransport(app=app)
     client = httpx.AsyncClient(transport=transport, base_url="http://loadtest")
-    return ScenarioApp(client=client, policy_store=policy_store, private_key_pem=private_pem)
+    return ScenarioApp(client=client, policy_store=policy_store, policy_cache=policy_cache, private_key_pem=private_pem)
 
 
 async def fire_concurrent(coro_factory: Callable[[int], Awaitable], n: int) -> List:

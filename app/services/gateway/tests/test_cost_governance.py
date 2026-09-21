@@ -1,7 +1,6 @@
 """Plan section 34.7: cost governance beyond the pre-existing hard
 monthly cap (test_usage.py's BudgetEnforcementTests) -- daily budget,
-per-application budget/attribution, soft-threshold warning, and the
-usage anomalies heuristic endpoint.
+per-application budget/attribution, and soft-threshold warning.
 """
 import unittest
 
@@ -215,89 +214,6 @@ class ApplicationBudgetIntegrationTests(unittest.TestCase):
         self.assertEqual(resp.status_code, 200)
         self.assertGreater(get_application(usage_store, "acme", "risk-chat", current_month()), 0.0)
         self.assertGreater(usage_store.get("acme", current_day()), 0.0)
-
-
-class UsageAnomaliesEndpointTests(unittest.TestCase):
-    def _app(self, *, policy_store, usage_store):
-        settings = load_settings()
-        fixture = get_auth_fixture()
-        app = create_app(
-            settings=settings, converse_client=FakeConverseClient(), token_verifier=fixture.verifier,
-            policy_store=policy_store, usage_store=usage_store,
-        )
-        return TestClient(app), fixture
-
-    def test_flags_tenant_with_spike_above_threshold(self):
-        policy_store = InMemoryPolicyStore({"acme": _policy()})
-        usage_store = InMemoryUsageStore()
-        for day in trailing_days(7):
-            usage_store.add_and_get("acme", day, 1.0)  # trailing avg = 1.0/day
-        usage_store.add_and_get("acme", current_day(), 10.0)  # today: 10x the average
-        client, fixture = self._app(policy_store=policy_store, usage_store=usage_store)
-        admin_token = fixture.token(sub="admin-1", tenant_id="platform", roles=["platform_admin"])
-
-        resp = client.get("/v1/admin/usage/anomalies", headers=auth_header(admin_token))
-
-        self.assertEqual(resp.status_code, 200)
-        body = resp.json()
-        self.assertEqual(body["method"], "heuristic")
-        flagged = {a["tenant_id"] for a in body["anomalies"]}
-        self.assertIn("acme", flagged)
-
-    def test_normal_spend_not_flagged(self):
-        policy_store = InMemoryPolicyStore({"acme": _policy()})
-        usage_store = InMemoryUsageStore()
-        for day in trailing_days(7):
-            usage_store.add_and_get("acme", day, 5.0)
-        usage_store.add_and_get("acme", current_day(), 5.5)  # roughly normal
-        client, fixture = self._app(policy_store=policy_store, usage_store=usage_store)
-        admin_token = fixture.token(sub="admin-1", tenant_id="platform", roles=["platform_admin"])
-
-        resp = client.get("/v1/admin/usage/anomalies", headers=auth_header(admin_token))
-
-        flagged = {a["tenant_id"] for a in resp.json()["anomalies"]}
-        self.assertNotIn("acme", flagged)
-
-    def test_no_trailing_history_is_never_flagged(self):
-        """A brand-new tenant's first day of spend must not
-        divide-by-zero into a trivial 'infinite' anomaly."""
-        policy_store = InMemoryPolicyStore({"acme": _policy()})
-        usage_store = InMemoryUsageStore()
-        usage_store.add_and_get("acme", current_day(), 500.0)
-        client, fixture = self._app(policy_store=policy_store, usage_store=usage_store)
-        admin_token = fixture.token(sub="admin-1", tenant_id="platform", roles=["platform_admin"])
-
-        resp = client.get("/v1/admin/usage/anomalies", headers=auth_header(admin_token))
-
-        flagged = {a["tenant_id"] for a in resp.json()["anomalies"]}
-        self.assertNotIn("acme", flagged)
-
-    def test_manager_sees_only_their_own_tenant(self):
-        policy_store = InMemoryPolicyStore(
-            {"finance": _policy(tenant_id="finance"), "other": _policy(tenant_id="other")}
-        )
-        usage_store = InMemoryUsageStore()
-        for tenant_id in ("finance", "other"):
-            for day in trailing_days(7):
-                usage_store.add_and_get(tenant_id, day, 1.0)
-            usage_store.add_and_get(tenant_id, current_day(), 100.0)
-        client, fixture = self._app(policy_store=policy_store, usage_store=usage_store)
-        manager_token = fixture.token(sub="mgr-1", tenant_id="finance", roles=["manager"])
-
-        resp = client.get("/v1/admin/usage/anomalies", headers=auth_header(manager_token))
-
-        flagged = {a["tenant_id"] for a in resp.json()["anomalies"]}
-        self.assertEqual(flagged, {"finance"})
-
-    def test_non_admin_or_manager_is_forbidden(self):
-        policy_store = InMemoryPolicyStore({"finance": _policy(tenant_id="finance")})
-        usage_store = InMemoryUsageStore()
-        client, fixture = self._app(policy_store=policy_store, usage_store=usage_store)
-        dev_token = fixture.token(sub="dev-1", tenant_id="finance", roles=["developer"])
-
-        resp = client.get("/v1/admin/usage/anomalies", headers=auth_header(dev_token))
-
-        self.assertEqual(resp.status_code, 403)
 
 
 if __name__ == "__main__":

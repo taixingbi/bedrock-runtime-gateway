@@ -163,24 +163,25 @@ class Settings:
     # DynamoDB-backed one, same fallback pattern as jobs_table_name.
     usage_table_name: str
 
-    # M11 Application Onboarding -- all empty means in-memory stores
-    # (tests, or an environment that hasn't applied the M11 tables
-    # yet); *_table_name empty specifically also means policy_store/
-    # iam_tenant_resolver stay plain FilePolicyStore/FileIamTenantResolver
-    # rather than being wrapped in a Layered* store (see main.py).
-    onboarding_requests_table_name: str
-    onboarding_audit_table_name: str
+    # M11 Application Onboarding (provisioned-application stores) --
+    # empty means the in-memory fallback (tests, or an environment that
+    # hasn't applied the M11 tables yet); empty specifically also means
+    # policy_store/iam_tenant_resolver stay plain
+    # FilePolicyStore/FileIamTenantResolver rather than being wrapped in
+    # a Layered* store (see main.py). These are read by every live
+    # request (LayeredPolicyStore/LayeredIamTenantResolver's primary
+    # layer), not just the admin/onboarding write surface that used to
+    # populate them (moved to platform-control-plane's own backend).
     provisioned_tenant_policies_table_name: str
     provisioned_principal_mappings_table_name: str
 
-    # Plan section 33 -- policy versioning/approval/rollback. Both empty
-    # means DynamoDbPolicyStore.apply_change() still works (in-memory
-    # history via InMemoryPolicyStore, or no history at all if
+    # Plan section 33 -- policy versioning/rollback. Empty means
+    # DynamoDbPolicyStore.apply_change() still works (in-memory history
+    # via InMemoryPolicyStore, or no history at all if
     # provisioned_tenant_policies_table_name is also unset) but
     # rollback()/list_history() on the Dynamo path degrade to "nothing
     # to roll back to" rather than erroring -- see store.py's
     # DynamoDbPolicyStore._archive().
-    policy_change_requests_table_name: str
     provisioned_tenant_policies_history_table_name: str
 
     # M12 (plan.md Section 5) -- empty means resolve AWS_IAM principals
@@ -254,10 +255,7 @@ def load_settings() -> Settings:
         jobs_queue_url=os.environ.get("JOBS_QUEUE_URL", ""),
         jobs_table_name=os.environ.get("JOBS_TABLE_NAME", ""),
         usage_table_name=os.environ.get("USAGE_TABLE_NAME", ""),
-        onboarding_requests_table_name=os.environ.get("ONBOARDING_REQUESTS_TABLE_NAME", ""),
-        onboarding_audit_table_name=os.environ.get("ONBOARDING_AUDIT_TABLE_NAME", ""),
         provisioned_tenant_policies_table_name=os.environ.get("PROVISIONED_TENANT_POLICIES_TABLE_NAME", ""),
-        policy_change_requests_table_name=os.environ.get("POLICY_CHANGE_REQUESTS_TABLE_NAME", ""),
         provisioned_tenant_policies_history_table_name=os.environ.get(
             "PROVISIONED_TENANT_POLICIES_HISTORY_TABLE_NAME", ""
         ),

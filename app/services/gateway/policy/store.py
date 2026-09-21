@@ -37,8 +37,9 @@ class PolicyStore(Protocol):
         ...
 
     def list_tenant_ids(self) -> List[str]:
-        """M8: every known tenant_id, for the admin usage/showback report
-        (api/admin_routes.py) to enumerate. Order is not guaranteed."""
+        """M8: every known tenant_id, for an admin usage/showback report
+        to enumerate (that report now lives in platform-control-plane's
+        own backend, not this repo). Order is not guaranteed."""
         ...
 
 

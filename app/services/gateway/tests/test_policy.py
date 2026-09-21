@@ -265,123 +265,31 @@ class RateLimitIntegrationTests(unittest.TestCase):
         self.assertEqual(second.json()["error"]["code"], "QUOTA_EXCEEDED")
 
 
-class AdminStateEndpointTests(unittest.TestCase):
-    def _app(self, policy_store):
-        settings = load_settings()
-        fixture = get_auth_fixture()
-        app = create_app(
-            settings=settings,
-            converse_client=FakeConverseClient(),
-            token_verifier=fixture.verifier,
-            policy_store=policy_store,
-        )
-        return TestClient(app), fixture
-
-    def test_admin_can_flip_tenant_state(self):
-        policy_store = InMemoryPolicyStore({"acme": _policy(tenant_id="acme")})
-        client, fixture = self._app(policy_store)
-        admin_token = fixture.token(sub="admin-1", tenant_id="platform", roles=["platform_admin"])
-
-        resp = client.put(
-            "/v1/admin/tenants/acme/state",
-            json={"state": "SUSPENDED"},
-            headers=auth_header(admin_token),
-        )
-
-        self.assertEqual(resp.status_code, 200)
-        body = resp.json()
-        self.assertEqual(body["state"], "SUSPENDED")
-        self.assertEqual(body["policy_epoch"], 2)  # bumped from 1
-        self.assertEqual(policy_store.get("acme").state, TenantState.SUSPENDED)
-
-    def test_non_admin_role_is_forbidden(self):
-        policy_store = InMemoryPolicyStore({"acme": _policy(tenant_id="acme")})
-        client, fixture = self._app(policy_store)
-        dev_token = fixture.token(sub="dev-1", tenant_id="acme", roles=["developer"])
-
-        resp = client.put(
-            "/v1/admin/tenants/acme/state",
-            json={"state": "SUSPENDED"},
-            headers=auth_header(dev_token),
-        )
-
-        self.assertEqual(resp.status_code, 403)
-
-    def test_manager_can_change_their_own_tenant_state(self):
-        """plan section 30: a tenant-scoped manager, unlike platform_admin,
-        may only act on the tenant they belong to."""
-        policy_store = InMemoryPolicyStore({"acme": _policy(tenant_id="acme")})
-        client, fixture = self._app(policy_store)
-        manager_token = fixture.token(sub="mgr-1", tenant_id="acme", roles=["manager"])
-
-        resp = client.put(
-            "/v1/admin/tenants/acme/state",
-            json={"state": "SUSPENDED"},
-            headers=auth_header(manager_token),
-        )
-
-        self.assertEqual(resp.status_code, 200)
-        self.assertEqual(policy_store.get("acme").state, TenantState.SUSPENDED)
-
-    def test_manager_cannot_change_another_tenants_state(self):
-        policy_store = InMemoryPolicyStore(
-            {"acme": _policy(tenant_id="acme"), "other": _policy(tenant_id="other")}
-        )
-        client, fixture = self._app(policy_store)
-        manager_token = fixture.token(sub="mgr-1", tenant_id="acme", roles=["manager"])
-
-        resp = client.put(
-            "/v1/admin/tenants/other/state",
-            json={"state": "SUSPENDED"},
-            headers=auth_header(manager_token),
-        )
-
-        self.assertEqual(resp.status_code, 403)
-        self.assertEqual(policy_store.get("other").state, TenantState.ACTIVE)  # unchanged
-
-    def test_unknown_tenant_is_404(self):
-        policy_store = InMemoryPolicyStore({})
-        client, fixture = self._app(policy_store)
-        admin_token = fixture.token(sub="admin-1", tenant_id="platform", roles=["platform_admin"])
-
-        resp = client.put(
-            "/v1/admin/tenants/ghost/state",
-            json={"state": "SUSPENDED"},
-            headers=auth_header(admin_token),
-        )
-
-        self.assertEqual(resp.status_code, 404)
-
-    def test_invalid_state_value_is_400(self):
-        policy_store = InMemoryPolicyStore({"acme": _policy(tenant_id="acme")})
-        client, fixture = self._app(policy_store)
-        admin_token = fixture.token(sub="admin-1", tenant_id="platform", roles=["platform_admin"])
-
-        resp = client.put(
-            "/v1/admin/tenants/acme/state",
-            json={"state": "NOT_A_REAL_STATE"},
-            headers=auth_header(admin_token),
-        )
-
-        self.assertEqual(resp.status_code, 400)
+class PolicyPushInvalidationTests(unittest.TestCase):
+    """The admin/onboarding HTTP surface that used to flip tenant state
+    (admin_routes.py) moved to platform-control-plane's own backend --
+    it calls policy_store.set_state() + policy_cache.invalidate() the
+    same way that endpoint used to, exercising this app's own read path
+    only (policy_store/policy_cache are shared state across both real
+    services via the same DynamoDB table in production)."""
 
     def test_state_change_propagates_immediately_to_next_chat_request(self):
         """Push invalidation (plan section 8): the very next request after
-        an admin state flip sees it -- no need to wait out the policy
-        cache TTL."""
+        a state flip sees it -- no need to wait out the policy cache TTL."""
         fake = FakeConverseClient()
         settings = load_settings()
         fixture = get_auth_fixture()
         policy_store = InMemoryPolicyStore({"acme": _policy(tenant_id="acme", rpm_limit=60)})
+        policy_cache = PolicySnapshotCache(store=policy_store, ttl_s=settings.policy_cache_ttl_s)
         app = create_app(
             settings=settings,
             converse_client=fake,
             token_verifier=fixture.verifier,
             policy_store=policy_store,
+            policy_cache=policy_cache,
         )
         client = TestClient(app)
         chat_token = fixture.token(tenant_id="acme", roles=["developer"])
-        admin_token = fixture.token(sub="admin-1", tenant_id="platform", roles=["platform_admin"])
 
         pre = client.post(
             "/v1/chat",
@@ -390,12 +298,8 @@ class AdminStateEndpointTests(unittest.TestCase):
         )
         self.assertEqual(pre.status_code, 200)
 
-        block_resp = client.put(
-            "/v1/admin/tenants/acme/state",
-            json={"state": "EMERGENCY_BLOCK"},
-            headers=auth_header(admin_token),
-        )
-        self.assertEqual(block_resp.status_code, 200)
+        policy_store.set_state("acme", TenantState.EMERGENCY_BLOCK)
+        policy_cache.invalidate("acme")
 
         post = client.post(
             "/v1/chat",

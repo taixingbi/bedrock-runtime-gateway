@@ -1,7 +1,8 @@
 """Plan section 33: policy versioning/approval/rollback -- store-level
 unit tests (InMemoryPolicyStore.apply_change/rollback/list_history,
-policy/validation.py). API-level tests (propose/approve/reject/rollback
-endpoints, ABAC, role gating) live in test_policy_change_requests.py.
+policy/validation.py). The API-level propose/approve/reject/rollback
+endpoints these once backed now live in platform-control-plane's own
+backend, not this repo.
 """
 import unittest
 

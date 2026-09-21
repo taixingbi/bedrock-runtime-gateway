@@ -13,6 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
 from loadtests.fault_injection import AlwaysAllowGuardrailClient, ThrottlingFaultConverseClient
 from loadtests.harness import build_scenario_app, default_tenant_policy, fire_concurrent
+from services.gateway.policy.models import TenantState
 
 
 class KillSwitchUnderLoadScenarioTests(unittest.IsolatedAsyncioTestCase):
@@ -36,12 +37,12 @@ class KillSwitchUnderLoadScenarioTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(all(r.status_code == 200 for r in pre))
             calls_before_block = fake.total_calls
 
-            block_resp = await scenario.client.put(
-                "/v1/admin/tenants/acme/state",
-                json={"state": "EMERGENCY_BLOCK"},
-                headers=scenario.admin_header(),
-            )
-            self.assertEqual(block_resp.status_code, 200)
+            # The admin API that used to flip this over HTTP (M2's
+            # push-invalidation) is now platform-control-plane's own
+            # backend, not this repo's -- call policy_store/policy_cache
+            # directly, the same two calls that endpoint used to make.
+            scenario.policy_store.set_state("acme", TenantState.EMERGENCY_BLOCK)
+            scenario.policy_cache.invalidate("acme")
 
             # No wait for any TTL -- push invalidation (M2) means the
             # very next requests already see the new state.
@@ -83,14 +84,12 @@ class PolicyUpdateUnderLoadScenarioTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(all(r.json()["cache_hit"] for r in burst1))
             self.assertEqual(fake.total_calls, calls_after_warm)
 
-            # Bump policy_epoch via the real admin endpoint while
-            # "in flight" (immediately before the next burst).
-            bump_resp = await scenario.client.put(
-                "/v1/admin/tenants/acme/state",
-                json={"state": "ACTIVE"},  # unchanged state, still bumps policy_epoch
-                headers=scenario.admin_header(),
-            )
-            self.assertEqual(bump_resp.status_code, 200)
+            # Bump policy_epoch directly (same two calls the admin
+            # endpoint used to make over HTTP -- see the kill-switch
+            # scenario above) while "in flight", immediately before the
+            # next burst.
+            scenario.policy_store.set_state("acme", TenantState.ACTIVE)  # unchanged state, still bumps policy_epoch
+            scenario.policy_cache.invalidate("acme")
 
             burst2 = await fire_concurrent(make_request, 20)
         finally:

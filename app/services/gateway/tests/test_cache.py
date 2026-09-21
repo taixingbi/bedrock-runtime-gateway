@@ -6,6 +6,7 @@ from ..cache.keys import build_cache_key
 from ..cache.store import CachedResponse, InMemoryResponseCache
 from ..config import load_settings
 from ..main import create_app
+from ..policy.cache import PolicySnapshotCache
 from ..policy.models import TenantPolicy, TenantState
 from ..policy.store import InMemoryPolicyStore
 from .auth_fixtures import auth_header, get_auth_fixture
@@ -89,14 +90,17 @@ class InMemoryResponseCacheTests(unittest.TestCase):
 
 
 class CacheIntegrationTests(unittest.TestCase):
-    def _app(self, *, converse_client, policy_store):
+    def _app(self, *, converse_client, policy_store, policy_cache=None):
         settings = load_settings()
         fixture = get_auth_fixture()
+        if policy_cache is None:
+            policy_cache = PolicySnapshotCache(store=policy_store, ttl_s=settings.policy_cache_ttl_s)
         app = create_app(
             settings=settings,
             converse_client=converse_client,
             token_verifier=fixture.verifier,
             policy_store=policy_store,
+            policy_cache=policy_cache,
         )
         return TestClient(app), fixture
 
@@ -118,24 +122,23 @@ class CacheIntegrationTests(unittest.TestCase):
         self.assertEqual(len(fake.calls), 1)  # Bedrock called only once
 
     def test_policy_epoch_bump_invalidates_cache(self):
-        """Going through the real admin endpoint (not mutating the policy
-        store directly) so the M2 push-invalidation actually fires --
-        otherwise the gateway's PolicySnapshotCache would keep serving the
-        pre-bump policy for up to policy_cache_ttl_s regardless of what
-        changed underneath it."""
+        """Calling policy_store.set_state() + policy_cache.invalidate()
+        directly (what the admin API -- now platform-control-plane's own
+        backend, not this repo's -- used to do over HTTP) so the M2
+        push-invalidation actually fires: otherwise the gateway's
+        PolicySnapshotCache would keep serving the pre-bump policy for up
+        to policy_cache_ttl_s regardless of what changed underneath it."""
         fake = FakeConverseClient(response_text="first answer")
         policy_store = InMemoryPolicyStore({"acme": _policy(tenant_id="acme")})
-        client, fixture = self._app(converse_client=fake, policy_store=policy_store)
+        settings = load_settings()
+        policy_cache = PolicySnapshotCache(store=policy_store, ttl_s=settings.policy_cache_ttl_s)
+        client, fixture = self._app(converse_client=fake, policy_store=policy_store, policy_cache=policy_cache)
         token = fixture.token(tenant_id="acme")
-        admin_token = fixture.token(sub="admin-1", tenant_id="platform", roles=["platform_admin"])
         body = {"messages": [{"role": "user", "content": "same question"}]}
 
         first = client.post("/v1/chat", json=body, headers=auth_header(token))
-        client.put(
-            "/v1/admin/tenants/acme/state",
-            json={"state": "ACTIVE"},  # unchanged state, but still bumps policy_epoch + invalidates
-            headers=auth_header(admin_token),
-        )
+        policy_store.set_state("acme", TenantState.ACTIVE)  # unchanged state, but still bumps policy_epoch
+        policy_cache.invalidate("acme")
         second = client.post("/v1/chat", json=body, headers=auth_header(token))
 
         self.assertFalse(first.json()["cache_hit"])

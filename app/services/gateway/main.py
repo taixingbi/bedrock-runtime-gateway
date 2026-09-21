@@ -17,9 +17,7 @@ from opentelemetry import trace
 from starlette.middleware import Middleware
 from starlette.responses import JSONResponse
 
-from .api.admin_routes import build_admin_router
 from .api.jobs_routes import build_jobs_router
-from .api.onboarding_routes import build_onboarding_router
 from .api.routes import build_router
 from .auth.aws_iam import (
     DynamoDbIamTenantResolver,
@@ -42,10 +40,7 @@ from .guardrails.client import GuardrailClient
 from .inference.bedrock_client import BedrockClient, ConverseClient
 from .jobs.queue import InMemoryJobQueue, JobQueue, SqsJobQueue
 from .jobs.store import DynamoDbJobStore, InMemoryJobStore, JobStore
-from .onboarding.audit import AuditStore, DynamoDbAuditStore, InMemoryAuditStore
-from .onboarding.store import DynamoDbOnboardingStore, InMemoryOnboardingStore, OnboardingStore
 from .policy.cache import PolicySnapshotCache
-from .policy.change_requests import DynamoDbPolicyChangeStore, InMemoryPolicyChangeStore, PolicyChangeStore
 from .policy.rate_limiter import DynamoDbRateLimiter, TokenBucketRateLimiter
 from .policy.store import (
     DynamoDbPolicyStore,
@@ -106,11 +101,9 @@ def create_app(
     job_queue: Optional[JobQueue] = None,
     usage_store: Optional[UsageStore] = None,
     certified_model_ids: Optional[Set[str]] = None,
-    onboarding_store: Optional[OnboardingStore] = None,
-    onboarding_audit_store: Optional[AuditStore] = None,
+    policy_cache: Optional[PolicySnapshotCache] = None,
     policy_store_primary: Optional[ProvisionedPolicyStore] = None,
     iam_tenant_resolver_primary: Optional[ProvisionedIamTenantResolver] = None,
-    policy_change_store: Optional[PolicyChangeStore] = None,
     enterprise_group_resolver: Optional[EnterpriseGroupResolver] = None,
     model_registry: Optional[Dict[str, ModelRegistryEntry]] = None,
     request_audit_store: Optional[RequestAuditStore] = None,
@@ -130,7 +123,10 @@ def create_app(
         token_verifier = _build_default_token_verifier(settings)
     # M11: primary (provisioned-application) stores exist independently
     # of whether iam_tenant_resolver/policy_store were overridden below
-    # -- onboarding_routes.py always needs something to write to.
+    # -- LayeredIamTenantResolver/LayeredPolicyStore below read from
+    # these as the primary layer for every live request, not just an
+    # admin-only path (the admin/onboarding write surface that used to
+    # populate them moved to platform-control-plane's own backend).
     if iam_tenant_resolver_primary is None:
         iam_tenant_resolver_primary = (
             DynamoDbIamTenantResolver(
@@ -233,7 +229,8 @@ def create_app(
             else InMemoryRequestAuditStore()
         )
 
-    policy_cache = PolicySnapshotCache(store=policy_store, ttl_s=settings.policy_cache_ttl_s)
+    if policy_cache is None:
+        policy_cache = PolicySnapshotCache(store=policy_store, ttl_s=settings.policy_cache_ttl_s)
     router = CertifiedRouter(
         converse_client=converse_client,
         circuit_breaker=circuit_breaker,
@@ -266,30 +263,8 @@ def create_app(
             if settings.usage_table_name
             else InMemoryUsageStore()
         )
-    if onboarding_store is None:
-        onboarding_store = (
-            DynamoDbOnboardingStore(table_name=settings.onboarding_requests_table_name, region=settings.aws_region)
-            if settings.onboarding_requests_table_name
-            else InMemoryOnboardingStore()
-        )
-    if onboarding_audit_store is None:
-        onboarding_audit_store = (
-            DynamoDbAuditStore(table_name=settings.onboarding_audit_table_name, region=settings.aws_region)
-            if settings.onboarding_audit_table_name
-            else InMemoryAuditStore()
-        )
     if enterprise_group_resolver is None:
         enterprise_group_resolver = FileEnterpriseGroupResolver(settings.enterprise_groups_path)
-    if policy_change_store is None:
-        # Reuses the onboarding audit table's DynamoDbAuditStore shape
-        # for its own event trail (see admin_routes.py's AuditEvent
-        # calls keyed by change_id) -- this is a separate table, just
-        # the same generic "who/what/when" store, not shared state.
-        policy_change_store = (
-            DynamoDbPolicyChangeStore(table_name=settings.policy_change_requests_table_name, region=settings.aws_region)
-            if settings.policy_change_requests_table_name
-            else InMemoryPolicyChangeStore()
-        )
 
     router_ = build_router(
         router=router,
@@ -311,20 +286,6 @@ def create_app(
         model_registry=model_registry,
         request_audit_store=request_audit_store,
     )
-    admin_router = build_admin_router(
-        policy_store=policy_store,
-        policy_cache=policy_cache,
-        settings=settings,
-        token_verifier=token_verifier,
-        iam_tenant_resolver=iam_tenant_resolver,
-        usage_store=usage_store,
-        route_sets=route_sets,
-        certified_model_ids=certified_model_ids,
-        policy_store_primary=policy_store_primary,
-        policy_change_store=policy_change_store,
-        audit_store=onboarding_audit_store,
-        enterprise_group_resolver=enterprise_group_resolver,
-    )
     jobs_router = build_jobs_router(
         settings=settings,
         token_verifier=token_verifier,
@@ -339,18 +300,6 @@ def create_app(
         enterprise_group_resolver=enterprise_group_resolver,
         model_registry=model_registry,
     )
-    onboarding_router = build_onboarding_router(
-        onboarding_store=onboarding_store,
-        audit_store=onboarding_audit_store,
-        policy_store=policy_store,
-        policy_store_primary=policy_store_primary,
-        iam_tenant_resolver=iam_tenant_resolver,
-        iam_tenant_resolver_primary=iam_tenant_resolver_primary,
-        settings=settings,
-        token_verifier=token_verifier,
-        enterprise_group_resolver=enterprise_group_resolver,
-    )
-
     async def unhandled_error(request: Request, exc: Exception) -> JSONResponse:
         request_id = getattr(request.state, "request_id", str(uuid.uuid4()))
         log_event(
@@ -390,9 +339,7 @@ def create_app(
         },
     )
     app.include_router(router_)
-    app.include_router(admin_router)
     app.include_router(jobs_router)
-    app.include_router(onboarding_router)
     app.state.settings = settings
     return app
 

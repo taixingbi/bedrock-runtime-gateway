@@ -11,7 +11,12 @@ resource tenant_id), so it gets one small function, not a framework.
 
 This is what makes `manager` (tenant-scoped: can only touch their own
 tenant) distinct from `platform_admin` (global override) -- before this
-existed, "admin" was all-or-nothing, see admin_routes.py's retrofit.
+existed, "admin" was all-or-nothing. The admin endpoints that originally
+motivated this (this repo's own admin_routes.py) have since moved to
+platform-control-plane's own backend, so pipeline.authorize_tenant_match
+has no live caller left in this repo right now -- kept as a tested,
+general-purpose primitive (see test_rbac.py) for the next route that
+needs it, not dead code.
 """
 from __future__ import annotations
 

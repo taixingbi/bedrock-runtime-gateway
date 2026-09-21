@@ -5,21 +5,23 @@ on:
     branches: [main]
     paths:
       - "infra/**"
+      - "ci_identity/**"
       - ".github/workflows/infra-ci.yml"
   pull_request:
     branches: [main]
     paths:
       - "infra/**"
+      - "ci_identity/**"
       - ".github/workflows/infra-ci.yml"
 
 jobs:
   fmt-validate:
-    name: fmt + validate (${{ matrix.environment }})
+    name: fmt + validate (${{ matrix.dir }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        environment: [dev, prod]
+        dir: [infra/environments/dev, infra/environments/prod, ci_identity]
     steps:
       - uses: actions/checkout@v4
 
@@ -28,18 +30,18 @@ jobs:
           terraform_version: "1.16.1"
 
       - name: terraform fmt -check
-        run: terraform fmt -check -recursive infra
+        run: terraform fmt -check -recursive infra ci_identity
 
       - name: terraform init (no backend, validate only)
-        working-directory: infra/environments/${{ matrix.environment }}
+        working-directory: ${{ matrix.dir }}
         run: terraform init -backend=false -input=false
 
       - name: terraform validate
-        working-directory: infra/environments/${{ matrix.environment }}
+        working-directory: ${{ matrix.dir }}
         run: terraform validate
 
   plan:
-    name: plan (${{ matrix.environment }})
+    name: plan (${{ matrix.dir }})
     needs: fmt-validate
     runs-on: ubuntu-latest
     environment: plan
@@ -52,7 +54,9 @@ jobs:
       # whatever commit_sha is being promoted -- not against whatever
       # main happens to be at push time.
       matrix:
-        environment: [dev]
+        dir: [infra/environments/dev, ci_identity]
+    env:
+      TF_VAR_github_org: taixingbi
     steps:
       - uses: actions/checkout@v4
 
@@ -66,11 +70,11 @@ jobs:
           terraform_version: "1.16.1"
 
       - name: terraform init
-        working-directory: infra/environments/${{ matrix.environment }}
+        working-directory: ${{ matrix.dir }}
         run: terraform init -input=false
 
       - name: terraform plan
-        working-directory: infra/environments/${{ matrix.environment }}
+        working-directory: ${{ matrix.dir }}
         run: terraform plan -input=false -lock=false
 
   # Plan section 35.9 (P2 production hardening) -- IaC scanning.
@@ -101,7 +105,7 @@ jobs:
           sarif_file: tfsec.sarif
 
   apply-dev:
-    name: apply (dev)
+    name: apply (${{ matrix.dir }})
     needs: fmt-validate
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
@@ -111,6 +115,12 @@ jobs:
     permissions:
       id-token: write
       contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        dir: [infra/environments/dev, ci_identity]
+    env:
+      TF_VAR_github_org: taixingbi
     steps:
       - uses: actions/checkout@v4
 
@@ -124,9 +134,9 @@ jobs:
           terraform_version: "1.16.1"
 
       - name: terraform init
-        working-directory: infra/environments/dev
+        working-directory: ${{ matrix.dir }}
         run: terraform init -input=false
 
       - name: terraform apply
-        working-directory: infra/environments/dev
+        working-directory: ${{ matrix.dir }}
         run: terraform apply -input=false -auto-approve

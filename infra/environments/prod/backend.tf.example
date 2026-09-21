@@ -1,0 +1,14 @@
+# Rename to backend.tf once the state bucket/table below exist (see
+# infra/README.md's bootstrap step -- they can't be created by the same
+# Terraform that needs them). Until then this environment uses local
+# state, which is fine for a solo first apply but not for a team.
+
+# terraform {
+#   backend "s3" {
+#     bucket         = "<your-tfstate-bucket>"
+#     key            = "bedrock-gateway-platform/prod/terraform.tfstate"
+#     region         = "us-east-1"
+#     dynamodb_table = "<your-tfstate-lock-table>"
+#     encrypt        = true
+#   }
+# }

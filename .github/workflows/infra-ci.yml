@@ -1,0 +1,132 @@
+name: Infra CI
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "infra/**"
+      - ".github/workflows/infra-ci.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "infra/**"
+      - ".github/workflows/infra-ci.yml"
+
+jobs:
+  fmt-validate:
+    name: fmt + validate (${{ matrix.environment }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        environment: [global, dev, prod]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.9"
+
+      - name: terraform fmt -check
+        run: terraform fmt -check -recursive infra
+
+      - name: terraform init (no backend, validate only)
+        working-directory: infra/environments/${{ matrix.environment }}
+        run: terraform init -backend=false -input=false
+
+      - name: terraform validate
+        working-directory: infra/environments/${{ matrix.environment }}
+        run: terraform validate
+
+  plan:
+    name: plan (${{ matrix.environment }})
+    needs: fmt-validate
+    runs-on: ubuntu-latest
+    environment: plan
+    permissions:
+      id-token: write
+      contents: read
+    strategy:
+      fail-fast: false
+      # prod's plan lives in infra-promote-prod.yml instead, run against
+      # whatever commit_sha is being promoted -- not against whatever
+      # main happens to be at push time.
+      matrix:
+        environment: [dev]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_INFRA_PLAN_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.9"
+
+      - name: terraform init
+        working-directory: infra/environments/${{ matrix.environment }}
+        run: terraform init -input=false
+
+      - name: terraform plan
+        working-directory: infra/environments/${{ matrix.environment }}
+        run: terraform plan -input=false -lock=false
+
+  # Plan section 35.9 (P2 production hardening) -- IaC scanning.
+  # Deliberately NOT in apply-dev's `needs:` (same reasoning as this
+  # repo's own app-ci.yml CodeQL/Trivy/pip-audit jobs) -- gating apply
+  # from day one would immediately block on whatever pre-existing
+  # findings this first run surfaces. Findings upload as SARIF to the
+  # repo's Security tab; a specific severity threshold becoming
+  # apply-blocking is a deliberate follow-up, not flipped on blind.
+  #
+  # Scans from repo root (unscoped) -- harmless over-walk of app/
+  # (zero .tf files there), and both this step's sarif_file and
+  # upload-sarif's below agree on the same repo-root-relative path,
+  # so there's no working-directory mismatch to fix here.
+  tfsec:
+    name: IaC scan (tfsec)
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aquasecurity/tfsec-sarif-action@v0.1.4
+        with:
+          sarif_file: tfsec.sarif
+      - uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: tfsec.sarif
+
+  apply-dev:
+    name: apply (dev)
+    needs: fmt-validate
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    # "apply-dev" has no required reviewers -- dev deploys automatically
+    # on every push to main once fmt/validate passes.
+    environment: apply-dev
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_INFRA_APPLY_DEV_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.9"
+
+      - name: terraform init
+        working-directory: infra/environments/dev
+        run: terraform init -input=false
+
+      - name: terraform apply
+        working-directory: infra/environments/dev
+        run: terraform apply -input=false -auto-approve

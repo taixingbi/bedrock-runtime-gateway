@@ -1,0 +1,12 @@
+# Rename to backend.tf once the state bucket/table below exist (see
+# infra/README.md's bootstrap step).
+
+# terraform {
+#   backend "s3" {
+#     bucket         = "<your-tfstate-bucket>"
+#     key            = "bedrock-gateway-platform/global/terraform.tfstate"
+#     region         = "us-east-1"
+#     dynamodb_table = "<your-tfstate-lock-table>"
+#     encrypt        = true
+#   }
+# }

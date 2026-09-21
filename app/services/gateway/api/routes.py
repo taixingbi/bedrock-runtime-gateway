@@ -1,0 +1,618 @@
+"""HTTP handlers for the gateway API: /healthz, /v1/chat.
+
+FastAPI (APIRouter), not raw Starlette routing -- gets free OpenAPI
+docs/schema (/docs, /openapi.json) at the cost of request bodies being
+parsed/validated by FastAPI's dependency injection *before* the
+handler body runs, rather than by hand after auth. That reordering is
+deliberate and judged safe: no pipeline stage's ordering guarantee
+(plan section 1's invariants) is about body-shape-vs-auth precedence,
+only about safety/policy checks happening before the model is ever
+called -- a client sending both a bad token and a malformed body gets
+some 4xx either way, and no test exercises that specific combination.
+main.py's `invalid_request_body` exception handler reformats FastAPI's
+default validation-error shape back into this gateway's existing
+ErrorResponse contract (400, INVALID_JSON/INVALID_REQUEST, request_id)
+so callers see no difference from before the migration.
+"""
+from __future__ import annotations
+
+import time
+import uuid
+from typing import Dict, Optional
+
+from fastapi import APIRouter, Request
+from opentelemetry import trace
+from starlette.responses import JSONResponse, StreamingResponse
+
+from .. import pipeline
+from ..auth import aws_iam
+from ..auth.aws_iam import IamTenantResolver
+from ..auth.enterprise_groups import EnterpriseGroupResolver
+from ..auth.jwt_verifier import TokenVerifier
+from ..cache.keys import build_cache_key, normalize_messages
+from ..cache.store import CachedResponse, ResponseCache
+from ..concurrency import BlockingCallRunner, BlockingCallTimeoutError, ConcurrencyLimiter
+from ..config import Settings
+from ..guardrails.client import GuardrailClient
+from ..inference.bedrock_client import BedrockChatMessage, BedrockInvocationError
+from ..policy.cache import PolicySnapshotCache
+from ..policy.rate_limiter import TokenBucketRateLimiter
+from ..routing.circuit_breaker import CircuitBreaker
+from ..routing.model_registry import ModelRegistryEntry
+from ..routing.router import AllRoutesUnavailableError, CertifiedRouter
+from ..streaming import stream_chat_response
+from ..telemetry.cost import estimate_cost
+from ..telemetry.debug_capture import DebugCaptureStore, S3AuditStore
+from ..telemetry.logging import get_logger, log_event
+from ..telemetry.otel import set_span_attributes
+from ..telemetry.request_audit import RequestAuditEvent, RequestAuditStore, current_trace_id
+from ..telemetry.slo import slo_breached
+from ..usage.store import UsageStore, add_and_get_application, current_day, current_month
+from .errors import error_response as _error
+from .schemas import ChatRequest, ChatResponse, Usage
+
+_chat_logger = get_logger("gateway.chat")
+
+# BedrockInvocationError.code -> (http_status, public error code)
+_ERROR_STATUS_MAP = {
+    "ThrottlingException": (429, "UPSTREAM_THROTTLED"),
+    "ServiceUnavailableException": (503, "UPSTREAM_UNAVAILABLE"),
+    "ModelTimeoutException": (504, "UPSTREAM_TIMEOUT"),
+    "InternalServerException": (502, "UPSTREAM_ERROR"),
+}
+_DEFAULT_ERROR_STATUS = (502, "UPSTREAM_ERROR")
+
+
+def build_router(
+    *,
+    router: CertifiedRouter,
+    settings: Settings,
+    token_verifier: TokenVerifier,
+    iam_tenant_resolver: IamTenantResolver,
+    policy_cache: PolicySnapshotCache,
+    rate_limiter: TokenBucketRateLimiter,
+    guardrail_client: GuardrailClient,
+    response_cache: ResponseCache,
+    circuit_breaker: CircuitBreaker,
+    tracer: trace.Tracer,
+    debug_capture_store: DebugCaptureStore,
+    usage_store: UsageStore,
+    concurrency_limiter: ConcurrencyLimiter,
+    blocking_call_runner: BlockingCallRunner,
+    audit_store: Optional[S3AuditStore] = None,
+    enterprise_group_resolver: Optional[EnterpriseGroupResolver] = None,
+    model_registry: Optional[Dict[str, ModelRegistryEntry]] = None,
+    request_audit_store: Optional[RequestAuditStore] = None,
+) -> APIRouter:
+    api_router = APIRouter()
+
+    async def _run_blocking_limited(tenant_id: str, tenant_max, func, *args, **kwargs):
+        """Plan section 16's concurrency fix: acquire a fast-reject slot
+        (tenant + global), run `func` off the event loop with a total
+        timeout, always release the slot after -- whatever `func` itself
+        raises (guardrail BLOCK, BedrockInvocationError, ...) propagates
+        to the caller unchanged; this only adds admission control and
+        thread offload around it."""
+        lease_token = concurrency_limiter.try_acquire(tenant_id, tenant_max=tenant_max)
+        if not lease_token:
+            raise pipeline.PipelineError(
+                429, "CONCURRENCY_LIMIT_EXCEEDED",
+                f"tenant '{tenant_id}' exceeded its concurrent-request limit, or the gateway is globally saturated",
+            )
+        try:
+            return await blocking_call_runner.run(func, *args, **kwargs)
+        finally:
+            concurrency_limiter.release(tenant_id, lease_token)
+
+    def _record_usage(tenant_id: str, application_id: str, cost: float) -> None:
+        """Plan section 34.7: records spend at the tenant-monthly level
+        (M8, unchanged), tenant-daily, and per-application level (both
+        new) -- see usage/store.py's add_and_get_application/
+        current_day for why this needs no new store/table."""
+        usage_store.add_and_get(tenant_id, current_month(), cost)
+        usage_store.add_and_get(tenant_id, current_day(), cost)
+        add_and_get_application(usage_store, tenant_id, application_id, current_month(), cost)
+
+    def _write_audit(
+        *,
+        request_id: str,
+        identity,
+        action: str,
+        status: int,
+        model: Optional[str] = None,
+        policy_version: Optional[int] = None,
+        authz_decision: Optional[str] = None,
+        decision_id: Optional[str] = None,
+        guardrail_version: Optional[str] = None,
+        guardrail_action: Optional[str] = None,
+        input_tokens: Optional[int] = None,
+        output_tokens: Optional[int] = None,
+        estimated_cost: Optional[float] = None,
+    ) -> None:
+        """Plan section 34.4: one durable, metadata-only record per
+        request -- see telemetry/request_audit.py's module docstring
+        for why this is safe to write unconditionally (no-op if
+        request_audit_store isn't configured, same optional-infra
+        pattern audit_store/S3AuditStore already use)."""
+        if request_audit_store is None:
+            return
+        request_audit_store.write(
+            RequestAuditEvent(
+                request_id=request_id,
+                tenant_id=identity.tenant_id,
+                application_id=identity.application_id,
+                principal=identity.sub,
+                action=action,
+                status=status,
+                trace_id=current_trace_id(),
+                model=model,
+                policy_version=policy_version,
+                authz_decision=authz_decision,
+                decision_id=decision_id,
+                guardrail_version=guardrail_version,
+                guardrail_action=guardrail_action,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                estimated_cost=estimated_cost,
+                timestamp=time.time(),
+            )
+        )
+
+    @api_router.get("/healthz")
+    async def healthz() -> dict:
+        return {"status": "ok"}
+
+    @api_router.post("/v1/chat", response_model=ChatResponse, response_model_exclude_none=True)
+    async def chat(request: Request, chat_request: ChatRequest):
+        request_id = getattr(request.state, "request_id", str(uuid.uuid4()))
+        session_id = getattr(request.state, "session_id", "")
+
+        with tracer.start_as_current_span("chat.request") as span:
+            set_span_attributes(span, request_id=request_id, session_id=session_id or None)
+
+            try:
+                # No Identity yet -- a pre-identity failure (bad/missing
+                # token, unknown IAM principal) has no tenant_id/
+                # application_id/principal to write an audit event
+                # about, so this stage is deliberately NOT audited.
+                identity = pipeline.authenticate(
+                    request.headers.get("authorization"),
+                    token_verifier=token_verifier,
+                    iam_principal_arn=request.headers.get(aws_iam.HEADER_PRINCIPAL_ARN),
+                    iam_account_id=request.headers.get(aws_iam.HEADER_ACCOUNT_ID),
+                    iam_tenant_resolver=iam_tenant_resolver,
+                    request_id=request_id,
+                    session_id=session_id or None,
+                    enterprise_group_resolver=enterprise_group_resolver,
+                )
+            except pipeline.PipelineError as exc:
+                set_span_attributes(span, status=exc.status_code, error=str(exc))
+                return _error(exc.status_code, exc.code, str(exc), request_id)
+
+            try:
+                authz = pipeline.authorize(
+                    identity, required_role=settings.chat_required_role, action="chat.completion"
+                )
+                policy = pipeline.resolve_policy(identity, policy_cache=policy_cache)
+            except pipeline.PipelineError as exc:
+                set_span_attributes(span, status=exc.status_code, error=str(exc))
+                # A role-check failure here IS a real authz DENY (unlike
+                # admission_decision's rejections below, which happen
+                # only after authz already ALLOWed) -- decision_id is
+                # unavailable when pipeline.authorize() itself is what
+                # raised (no Decision was ever returned), only when
+                # resolve_policy() is what failed instead.
+                _write_audit(
+                    request_id=request_id, identity=identity, action="chat.completion",
+                    status=exc.status_code, authz_decision="DENY" if exc.code == "FORBIDDEN" else "ALLOW",
+                )
+                return _error(exc.status_code, exc.code, str(exc), request_id)
+
+            # Plan section 34.6: kill-switch + rate-limit + budget as
+            # one reported decision instead of three separate calls --
+            # concurrency (stage 4c) is acquired later, per-blocking-
+            # call, not here (see admission_decision's docstring).
+            admission = pipeline.admission_decision(
+                policy, rate_limiter=rate_limiter, usage_store=usage_store,
+                month=current_month(), day=current_day(), application_id=identity.application_id,
+            )
+            if not admission.allowed:
+                exc = admission.error
+                set_span_attributes(span, status=exc.status_code, error=str(exc))
+                log_event(
+                    _chat_logger, "INFO", "request rejected by admission control",
+                    request_id=request_id, tenant_id=identity.tenant_id,
+                    stage=admission.stage, code=exc.code, priority_class=policy.priority_class,
+                )
+                _write_audit(
+                    request_id=request_id, identity=identity, action="chat.completion",
+                    status=exc.status_code, policy_version=policy.policy_epoch,
+                    # Authz already ALLOWed by this point (pipeline.authorize()
+                    # above) -- admission control (budget/rate-limit/kill-switch)
+                    # rejected this, not RBAC, so authz_decision stays ALLOW;
+                    # admission.stage/exc.code (logged above) is what actually
+                    # explains the rejection.
+                    authz_decision="ALLOW", decision_id=authz.decision_id,
+                )
+                return _error(exc.status_code, exc.code, str(exc), request_id)
+            if admission.warning:
+                log_event(
+                    _chat_logger, "WARNING", "budget soft warning",
+                    request_id=request_id, tenant_id=identity.tenant_id, warning=admission.warning,
+                )
+
+            set_span_attributes(
+                span, tenant_id=identity.tenant_id, application_id=identity.application_id,
+                policy_epoch=policy.policy_epoch, route_set=policy.route_set,
+            )
+
+            try:
+                model_id = pipeline.enforce_model_allowlist(
+                    policy, requested_model=chat_request.model, default_model=settings.bedrock_model_id
+                )
+                governance_warning = pipeline.enforce_model_certification(
+                    model_id, certified_model_ids=router.certified_model_ids,
+                    model_registry=model_registry, tenant_data_classification=policy.data_classification,
+                    fail_closed=settings.model_governance_fail_closed,
+                )
+                if governance_warning:
+                    log_event(
+                        _chat_logger, "WARNING", "model governance warning",
+                        request_id=request_id, tenant_id=identity.tenant_id, model=model_id,
+                        warning=governance_warning,
+                    )
+                # Plan section 35.16: the resource/context-aware half of
+                # centralized authorization -- model_id and
+                # policy.data_classification only exist from this point
+                # on, so this couldn't run any earlier (see
+                # pipeline.enforce_resource_authorization's docstring).
+                pipeline.enforce_resource_authorization(
+                    identity, action="llm.invoke", resource_id=model_id,
+                    context={"data_classification": policy.data_classification}
+                    if policy.data_classification
+                    else {},
+                    iam_tenant_resolver=iam_tenant_resolver, request_id=request_id,
+                    session_id=session_id or None,
+                )
+            except pipeline.PipelineError as exc:
+                set_span_attributes(span, status=exc.status_code, error=str(exc))
+                return _error(exc.status_code, exc.code, str(exc), request_id)
+
+            set_span_attributes(span, model=model_id)
+
+            combined_input_text = "\n".join(m.content for m in chat_request.messages)
+            guardrail_start = time.perf_counter()
+            try:
+                await _run_blocking_limited(
+                    identity.tenant_id, policy.max_concurrency,
+                    pipeline.check_input_guardrail,
+                    combined_input_text, policy=policy, guardrail_client=guardrail_client,
+                )
+            except BlockingCallTimeoutError as exc:
+                guardrail_ms = round((time.perf_counter() - guardrail_start) * 1000, 2)
+                set_span_attributes(span, status=504, error=str(exc))
+                log_event(
+                    _chat_logger, "ERROR", "chat request failed",
+                    request_id=request_id, model=model_id, status=504,
+                    tenant_id=identity.tenant_id, policy_epoch=policy.policy_epoch,
+                    guardrail_latency_ms=guardrail_ms, error=str(exc),
+                )
+                return _error(504, "UPSTREAM_TIMEOUT", str(exc), request_id)
+            except pipeline.PipelineError as exc:
+                guardrail_ms = round((time.perf_counter() - guardrail_start) * 1000, 2)
+                set_span_attributes(
+                    span, status=exc.status_code, error=str(exc),
+                    guardrail_version=policy.guardrail_policy, guardrail_action="BLOCK",
+                    guardrail_latency_ms=guardrail_ms, blocked_reason=str(exc),
+                )
+                log_event(
+                    _chat_logger, "ERROR", "chat request failed",
+                    request_id=request_id, model=model_id, status=exc.status_code,
+                    tenant_id=identity.tenant_id, policy_epoch=policy.policy_epoch,
+                    guardrail_version=policy.guardrail_policy, guardrail_action="BLOCK",
+                    guardrail_latency_ms=guardrail_ms,
+                    blocked_reason=str(exc), error=str(exc),
+                )
+                _write_audit(
+                    request_id=request_id, identity=identity, action="chat.completion",
+                    status=exc.status_code, model=model_id, policy_version=policy.policy_epoch,
+                    authz_decision="ALLOW",  # authz allowed the request through; the guardrail blocked it
+                    decision_id=authz.decision_id,
+                    guardrail_version=policy.guardrail_policy, guardrail_action="BLOCK",
+                )
+                return _error(exc.status_code, exc.code, str(exc), request_id)
+            input_guardrail_ms = round((time.perf_counter() - guardrail_start) * 1000, 2)
+
+            messages = [
+                BedrockChatMessage(role=m.role, text=m.content) for m in chat_request.messages
+            ]
+
+            if chat_request.stream:
+                # No cache, no output guardrail, no fallback for streaming
+                # -- documented simplification, see streaming.py's module
+                # docstring. No debug capture either (nothing to capture
+                # up front; the full output isn't known until the stream
+                # ends, and by then it's already been sent to the client).
+                if not circuit_breaker.allow(model_id):
+                    set_span_attributes(span, status=503, error="circuit open")
+                    return _error(
+                        503, "UPSTREAM_UNAVAILABLE",
+                        f"model '{model_id}' is temporarily unavailable (circuit open)",
+                        request_id,
+                    )
+                chunk_iter = router_converse_stream(
+                    router, model_id=model_id, messages=messages,
+                    max_tokens=chat_request.max_tokens, temperature=chat_request.temperature,
+                )
+                set_span_attributes(span, status=200, stream=True)
+                return StreamingResponse(
+                    stream_chat_response(
+                        chunk_iter,
+                        model_id=model_id,
+                        request_id=request_id,
+                        tenant_id=identity.tenant_id,
+                        circuit_breaker=circuit_breaker,
+                        is_disconnected=request.is_disconnected,
+                    ),
+                    media_type="text/event-stream",
+                    headers={"x-request-id": request_id, "cache-control": "no-cache"},
+                )
+
+            cache_key = build_cache_key(
+                tenant_id=identity.tenant_id,
+                application_id=identity.application_id,
+                policy=policy,
+                model_id=model_id,
+                max_tokens=chat_request.max_tokens,
+                temperature=chat_request.temperature,
+                messages=normalize_messages(chat_request.messages),
+            )
+            cached = response_cache.get(cache_key)
+
+            if cached is not None:
+                estimated_cost = estimate_cost(
+                    cached.model_id, input_tokens=cached.input_tokens, output_tokens=cached.output_tokens
+                )
+                _record_usage(identity.tenant_id, identity.application_id, estimated_cost)
+                payload_ref = None
+                if policy.debug_capture_enabled:
+                    debug_capture_store.capture(
+                        request_id=request_id, tenant_id=identity.tenant_id,
+                        input_text=combined_input_text, output_text=cached.text,
+                    )
+                    if audit_store is not None:
+                        payload_ref = audit_store.write(
+                            request_id=request_id, tenant_id=identity.tenant_id,
+                            application_id=identity.application_id, model=cached.model_id,
+                            input_text=combined_input_text, output_text=cached.text,
+                            input_tokens=cached.input_tokens, output_tokens=cached.output_tokens,
+                        )
+                set_span_attributes(
+                    span, status=200, model=cached.model_id,
+                    guardrail_version=policy.guardrail_policy, guardrail_action="ALLOW",
+                    guardrail_latency_ms=input_guardrail_ms,
+                    input_tokens=cached.input_tokens, output_tokens=cached.output_tokens,
+                    latency_ms=0.0, retry_count=0, fallback=False, cache_hit=True,
+                    estimated_cost=estimated_cost, slo_breach=False,
+                )
+                log_event(
+                    _chat_logger, "INFO", "chat request completed",
+                    request_id=request_id,
+                    tenant_id=identity.tenant_id, route_set=policy.route_set, policy_epoch=policy.policy_epoch,
+                    model=cached.model_id, guardrail_version=policy.guardrail_policy,
+                    guardrail_action="ALLOW", blocked_reason=None, payload_ref=payload_ref,
+                    input_tokens=cached.input_tokens, output_tokens=cached.output_tokens,
+                    guardrail_latency_ms=input_guardrail_ms, ttft_ms=None, latency_ms=0.0,
+                    retry_count=0, fallback=False, cache_hit=True,
+                    estimated_cost=estimated_cost, slo_breach=False, status=200,
+                )
+                _write_audit(
+                    request_id=request_id, identity=identity, action="chat.completion", status=200,
+                    model=cached.model_id, policy_version=policy.policy_epoch, authz_decision="ALLOW",
+                    decision_id=authz.decision_id,
+                    guardrail_version=policy.guardrail_policy, guardrail_action="ALLOW",
+                    input_tokens=cached.input_tokens, output_tokens=cached.output_tokens,
+                    estimated_cost=estimated_cost,
+                )
+                response = ChatResponse(
+                    request_id=request_id,
+                    model=cached.model_id,
+                    output=cached.text,
+                    stop_reason=cached.stop_reason,
+                    usage=Usage(input_tokens=cached.input_tokens, output_tokens=cached.output_tokens),
+                    latency_ms=0.0,
+                    cache_hit=True,
+                    fallback=False,
+                )
+                return JSONResponse(response.model_dump())
+
+            start = time.perf_counter()
+            try:
+                routed = await _run_blocking_limited(
+                    identity.tenant_id, policy.max_concurrency,
+                    router.converse,
+                    primary_model_id=model_id,
+                    route_set_name=policy.route_set,
+                    messages=messages,
+                    max_tokens=chat_request.max_tokens,
+                    temperature=chat_request.temperature,
+                )
+            except BedrockInvocationError as exc:
+                status_code, error_code = _ERROR_STATUS_MAP.get(exc.code, _DEFAULT_ERROR_STATUS)
+                set_span_attributes(span, status=status_code, error=str(exc))
+                log_event(
+                    _chat_logger, "ERROR", "chat request failed",
+                    request_id=request_id, model=model_id, status=status_code,
+                    tenant_id=identity.tenant_id, policy_epoch=policy.policy_epoch,
+                    latency_ms=round((time.perf_counter() - start) * 1000, 2),
+                    error=str(exc),
+                )
+                return _error(status_code, error_code, str(exc), request_id)
+            except AllRoutesUnavailableError as exc:
+                set_span_attributes(span, status=503, error=str(exc))
+                log_event(
+                    _chat_logger, "ERROR", "chat request failed",
+                    request_id=request_id, model=model_id, status=503,
+                    tenant_id=identity.tenant_id, policy_epoch=policy.policy_epoch,
+                    latency_ms=round((time.perf_counter() - start) * 1000, 2),
+                    error=str(exc),
+                )
+                return _error(503, "ALL_ROUTES_UNAVAILABLE", str(exc), request_id)
+            except BlockingCallTimeoutError as exc:
+                set_span_attributes(span, status=504, error=str(exc))
+                log_event(
+                    _chat_logger, "ERROR", "chat request failed",
+                    request_id=request_id, model=model_id, status=504,
+                    tenant_id=identity.tenant_id, policy_epoch=policy.policy_epoch,
+                    latency_ms=round((time.perf_counter() - start) * 1000, 2),
+                    error=str(exc),
+                )
+                return _error(504, "UPSTREAM_TIMEOUT", str(exc), request_id)
+            except pipeline.PipelineError as exc:
+                set_span_attributes(span, status=exc.status_code, error=str(exc))
+                log_event(
+                    _chat_logger, "ERROR", "chat request failed",
+                    request_id=request_id, model=model_id, status=exc.status_code,
+                    tenant_id=identity.tenant_id, policy_epoch=policy.policy_epoch,
+                    latency_ms=round((time.perf_counter() - start) * 1000, 2),
+                    error=str(exc),
+                )
+                return _error(exc.status_code, exc.code, str(exc), request_id)
+
+            result = routed.result
+
+            guardrail_start = time.perf_counter()
+            try:
+                await _run_blocking_limited(
+                    identity.tenant_id, policy.max_concurrency,
+                    pipeline.check_output_guardrail,
+                    result.text, policy=policy, guardrail_client=guardrail_client,
+                )
+            except BlockingCallTimeoutError as exc:
+                output_guardrail_ms = round((time.perf_counter() - guardrail_start) * 1000, 2)
+                set_span_attributes(
+                    span, status=504, error=str(exc), model=routed.model_id,
+                    guardrail_latency_ms=round(input_guardrail_ms + output_guardrail_ms, 2),
+                )
+                log_event(
+                    _chat_logger, "ERROR", "chat request failed",
+                    request_id=request_id, model=routed.model_id, status=504,
+                    tenant_id=identity.tenant_id, policy_epoch=policy.policy_epoch,
+                    guardrail_latency_ms=round(input_guardrail_ms + output_guardrail_ms, 2),
+                    error=str(exc),
+                )
+                return _error(504, "UPSTREAM_TIMEOUT", str(exc), request_id)
+            except pipeline.PipelineError as exc:
+                output_guardrail_ms = round((time.perf_counter() - guardrail_start) * 1000, 2)
+                set_span_attributes(
+                    span, status=exc.status_code, error=str(exc), model=routed.model_id,
+                    guardrail_version=policy.guardrail_policy, guardrail_action="BLOCK",
+                    guardrail_latency_ms=round(input_guardrail_ms + output_guardrail_ms, 2),
+                    blocked_reason=str(exc),
+                )
+                log_event(
+                    _chat_logger, "ERROR", "chat request failed",
+                    request_id=request_id, model=routed.model_id, status=exc.status_code,
+                    tenant_id=identity.tenant_id, policy_epoch=policy.policy_epoch,
+                    guardrail_version=policy.guardrail_policy, guardrail_action="BLOCK",
+                    guardrail_latency_ms=round(input_guardrail_ms + output_guardrail_ms, 2),
+                    blocked_reason=str(exc), error=str(exc),
+                )
+                return _error(exc.status_code, exc.code, str(exc), request_id)
+            output_guardrail_ms = round((time.perf_counter() - guardrail_start) * 1000, 2)
+
+            response_cache.set(
+                cache_key,
+                CachedResponse(
+                    text=result.text,
+                    stop_reason=result.stop_reason,
+                    input_tokens=result.input_tokens,
+                    output_tokens=result.output_tokens,
+                    model_id=routed.model_id,
+                ),
+            )
+
+            payload_ref = None
+            if policy.debug_capture_enabled:
+                debug_capture_store.capture(
+                    request_id=request_id, tenant_id=identity.tenant_id,
+                    input_text=combined_input_text, output_text=result.text,
+                )
+                if audit_store is not None:
+                    payload_ref = audit_store.write(
+                        request_id=request_id, tenant_id=identity.tenant_id,
+                        application_id=identity.application_id, model=routed.model_id,
+                        input_text=combined_input_text, output_text=result.text,
+                        input_tokens=result.input_tokens, output_tokens=result.output_tokens,
+                    )
+
+            estimated_cost = estimate_cost(
+                routed.model_id, input_tokens=result.input_tokens, output_tokens=result.output_tokens
+            )
+            _record_usage(identity.tenant_id, identity.application_id, estimated_cost)
+            breached = slo_breached(policy, result.latency_ms)
+
+            set_span_attributes(
+                span, status=200, model=routed.model_id,
+                guardrail_version=policy.guardrail_policy, guardrail_action="ALLOW",
+                guardrail_latency_ms=round(input_guardrail_ms + output_guardrail_ms, 2),
+                input_tokens=result.input_tokens, output_tokens=result.output_tokens,
+                latency_ms=result.latency_ms, retry_count=result.retry_count,
+                fallback=routed.fallback, cache_hit=False,
+                estimated_cost=estimated_cost, slo_breach=breached,
+            )
+            log_event(
+                _chat_logger, "INFO", "chat request completed",
+                request_id=request_id,
+                tenant_id=identity.tenant_id,
+                route_set=policy.route_set,
+                policy_epoch=policy.policy_epoch,
+                model=routed.model_id,
+                guardrail_version=policy.guardrail_policy,
+                guardrail_action="ALLOW",
+                blocked_reason=None,
+                payload_ref=payload_ref,
+                input_tokens=result.input_tokens,
+                output_tokens=result.output_tokens,
+                guardrail_latency_ms=round(input_guardrail_ms + output_guardrail_ms, 2),
+                ttft_ms=None,
+                latency_ms=result.latency_ms,
+                retry_count=result.retry_count,
+                fallback=routed.fallback,
+                cache_hit=False,
+                estimated_cost=estimated_cost,
+                slo_breach=breached,
+                status=200,
+            )
+            _write_audit(
+                request_id=request_id, identity=identity, action="chat.completion", status=200,
+                model=routed.model_id, policy_version=policy.policy_epoch, authz_decision="ALLOW",
+                decision_id=authz.decision_id,
+                guardrail_version=policy.guardrail_policy, guardrail_action="ALLOW",
+                input_tokens=result.input_tokens, output_tokens=result.output_tokens,
+                estimated_cost=estimated_cost,
+            )
+
+            response = ChatResponse(
+                request_id=request_id,
+                model=routed.model_id,
+                output=result.text,
+                stop_reason=result.stop_reason,
+                usage=Usage(input_tokens=result.input_tokens, output_tokens=result.output_tokens),
+                latency_ms=result.latency_ms,
+                cache_hit=False,
+                fallback=routed.fallback,
+            )
+            return JSONResponse(response.model_dump())
+
+    return api_router
+
+
+def router_converse_stream(router: CertifiedRouter, *, model_id, messages, max_tokens, temperature):
+    """Streaming bypasses CertifiedRouter's fallback loop (see module
+    docstring) but still goes through the same underlying ConverseClient
+    the router wraps, so streaming and non-streaming share one Bedrock
+    client configuration."""
+    return router.converse_client.converse_stream(
+        model_id=model_id, messages=messages, max_tokens=max_tokens, temperature=temperature
+    )

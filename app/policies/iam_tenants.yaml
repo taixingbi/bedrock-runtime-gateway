@@ -1,0 +1,123 @@
+# ============================================================
+# COPY -- not the source of truth. Canonical copy lives in
+# github.com/taixingbi/platform-policy-definitions (environments/dev/).
+# Sync by running scripts/sync-policies.sh against a checkout of
+# that repo. This copy exists only so `docker build` here keeps
+# working during the app/infra/policies repo split -- once the
+# gateway has a working S3/DynamoDB-backed PolicyStore, this
+# directory and the COPY step in Dockerfile go away entirely.
+# ============================================================
+# IAM principal -> tenant policy mapping (AWS_IAM/SigV4 auth path).
+#
+# The JWT path gets tenant_id/application_id/roles directly from a
+# verified token's claims (see auth/identity.py). A verified AWS IAM
+# principal ARN carries none of that, so this file is the IAM-path
+# equivalent of tenants.yaml: it says which tenant policy (still looked
+# up by tenant_id in tenants.yaml, unchanged) an already-authenticated
+# IAM caller gets mapped to, and which roles they're granted for
+# pipeline.authorize()'s RBAC check.
+#
+# Loaded once at startup by FileIamTenantResolver (see auth/aws_iam.py).
+# An ARN ending in "*" matches any principal ARN sharing that prefix --
+# used for assumed-role ARNs, since the session-name suffix
+# ("arn:...:assumed-role/<role>/<session-name>") is caller-chosen and
+# can't be enumerated in advance.
+#
+# A principal calling in via the AWS_IAM route with no entry here 403s
+# with UNKNOWN_IAM_PRINCIPAL -- add an entry (and grant that principal
+# execute-api:Invoke on the /iam/* route, see infra/README.md) before
+# a new caller can use this path.
+
+iam_principals:
+  "arn:aws:iam::646821141010:role/team-a-ai-client":
+    tenant_id: team-a
+    application_id: team-a-ai-client
+    roles: [developer, operator]
+
+  "arn:aws:sts::646821141010:assumed-role/team-a-ai-client/*":
+    tenant_id: team-a
+    application_id: team-a-ai-client
+    roles: [developer, operator]
+
+  # Manual curl/smoke testing via the IAM user's own long-term
+  # credentials (dev only -- do not add a real IAM user here in prod).
+  "arn:aws:iam::646821141010:user/taixingbi":
+    tenant_id: team-a
+    application_id: manual-smoke-test
+    roles: [developer, operator]
+
+  # Manual curl/smoke testing against the finance tenant specifically
+  # (dev only) -- finance has a real monthly_budget (tenants.yaml),
+  # unlike team-a's deliberately-tiny smoke-test budget above, so this
+  # is the entry to use to see an actual model response rather than an
+  # immediate BUDGET_EXCEEDED. Assumed via `aws sts assume-role` from
+  # the taixingbi user (see the role's trust policy).
+  "arn:aws:iam::646821141010:role/finance-manual-smoke-test":
+    tenant_id: finance
+    application_id: finance-manual-smoke-test
+    roles: [developer, operator]
+
+  "arn:aws:sts::646821141010:assumed-role/finance-manual-smoke-test/*":
+    tenant_id: finance
+    application_id: finance-manual-smoke-test
+    roles: [developer, operator]
+
+  # Manual curl/smoke testing of plan section 30's ABAC retrofit --
+  # tenant_id: finance + roles: [manager] should be able to see/change
+  # finance's own admin data (GET /v1/admin/usage, /v1/admin/tenants,
+  # PUT /v1/admin/tenants/finance/state) but get 403 acting on any
+  # other tenant, unlike finance-manual-smoke-test above (developer
+  # only, can't reach /v1/admin/* at all).
+  "arn:aws:iam::646821141010:role/finance-manager-smoke-test":
+    tenant_id: finance
+    application_id: finance-manager-smoke-test
+    roles: [manager]
+
+  "arn:aws:sts::646821141010:assumed-role/finance-manager-smoke-test/*":
+    tenant_id: finance
+    application_id: finance-manager-smoke-test
+    roles: [manager]
+
+  # Plan section 29's dedicated-tenant-account model -- tenant-a/tenant-b
+  # each have their own AWS account (998116076808 / 199013204390),
+  # deliberately kept as separate tenant_ids from team-a (not merged) --
+  # team-a stays the shared-account demo tenant (this account, tiny
+  # smoke-test budget), tenant-a/tenant-b are the dedicated-account
+  # isolation demo, showing both tenancy models side by side.
+  #
+  # Tested live 2026-09-17: a tenant account calling this API directly
+  # with its own SigV4 credentials (team-a-ai-client in 998116076808)
+  # 403s -- this platform's HTTP API v2 + AWS_IAM authorizer does not
+  # support cross-account invocation via a caller-side identity policy
+  # alone, and HTTP API v2 has no resource-policy mechanism to grant
+  # that trust either (unlike REST API v1). See plan.md section 29 for
+  # the two alternatives not taken.
+  #
+  # Fix: an assume-role hop. The tenant's own workload role
+  # (team-a-ai-client / team-b-ai-client, in its own account) assumes
+  # ANOTHER role that lives in THIS account -- tenant-a-platform-caller /
+  # tenant-b-platform-caller, trusting only that specific tenant-account
+  # role -- and calls the gateway with those (same-account) credentials
+  # instead. The gateway only ever sees the platform-side assumed-role
+  # ARN below, never the tenant account's own role directly, which is
+  # why the mapping keys off tenant-a-platform-caller, not
+  # tenant-a's team-a-ai-client.
+  "arn:aws:iam::646821141010:role/tenant-a-platform-caller":
+    tenant_id: tenant-a
+    application_id: team-a-ai-client
+    roles: [developer, operator]
+
+  "arn:aws:sts::646821141010:assumed-role/tenant-a-platform-caller/*":
+    tenant_id: tenant-a
+    application_id: team-a-ai-client
+    roles: [developer, operator]
+
+  "arn:aws:iam::646821141010:role/tenant-b-platform-caller":
+    tenant_id: tenant-b
+    application_id: team-b-ai-client
+    roles: [developer, operator]
+
+  "arn:aws:sts::646821141010:assumed-role/tenant-b-platform-caller/*":
+    tenant_id: tenant-b
+    application_id: team-b-ai-client
+    roles: [developer, operator]

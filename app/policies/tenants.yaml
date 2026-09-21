@@ -1,0 +1,114 @@
+# ============================================================
+# COPY -- not the source of truth. Canonical copy lives in
+# github.com/taixingbi/platform-policy-definitions (environments/dev/).
+# Sync by running scripts/sync-policies.sh against a checkout of
+# that repo. This copy exists only so `docker build` here keeps
+# working during the app/infra/policies repo split -- once the
+# gateway has a working S3/DynamoDB-backed PolicyStore, this
+# directory and the COPY step in Dockerfile go away entirely.
+# ============================================================
+# Tenant policy config (M2). Stands in for the DynamoDB-backed control
+# plane in plan section 8 -- see services/gateway/policy/store.py.
+#
+# Loaded once at startup by FilePolicyStore. To change a tenant's state
+# at runtime without restarting the gateway, use the admin API instead of
+# editing this file:
+#
+#   PUT /v1/admin/tenants/{tenant_id}/state   {"state": "SUSPENDED"}
+#
+# (requires a token with the ADMIN_REQUIRED_ROLE role, default
+# platform_admin) -- that takes effect immediately via push invalidation,
+# whereas a file edit only takes effect on the next process restart.
+
+tenants:
+  finance:
+    state: ACTIVE
+    models:
+      - us.amazon.nova-micro-v1:0
+      # Must a superset of finance-chat-v1's fallbacks (route_sets.yaml)
+      # -- validate.py enforces this so an automatic failover can never
+      # hand a tenant a model they never explicitly allowed.
+      - us.amazon.nova-lite-v1:0
+      - us.meta.llama3-3-70b-instruct-v1:0
+      - qwen.qwen3-32b-v1:0
+      - us.amazon.nova-pro-v1:0
+    rpm_limit: 300
+    guardrail_policy: finance-v1
+    route_set: finance-chat-v1
+    slo:
+      p95_latency_ms: 3000
+    policy_epoch: 1
+    monthly_budget: 10000 # M8 FinOps hard limit, USD/month
+
+  search:
+    state: ACTIVE
+    models:
+      - us.amazon.nova-micro-v1:0
+      # Must be a superset of search-chat-v1's fallbacks (route_sets.yaml)
+      # -- validate.py enforces this so an automatic failover can never
+      # hand a tenant a model they never explicitly allowed.
+      - us.amazon.nova-lite-v1:0
+      - us.meta.llama3-3-70b-instruct-v1:0
+      - qwen.qwen3-32b-v1:0
+      - us.amazon.nova-pro-v1:0
+    rpm_limit: 120
+    guardrail_policy: standard-v1
+    route_set: search-chat-v1
+    slo:
+      p95_latency_ms: 5000
+    policy_epoch: 1
+
+  sandbox:
+    state: ACTIVE
+    models: []   # no restriction beyond the gateway default model
+    rpm_limit: 30
+    guardrail_policy: standard-v1
+    policy_epoch: 1
+
+  # Callers authenticated via the AWS_IAM/SigV4 path (see
+  # policies/iam_tenants.yaml, which maps an IAM principal ARN to this
+  # tenant_id) rather than a JWT.
+  team-a:
+    state: ACTIVE
+    models: []   # no restriction beyond the gateway default model
+    rpm_limit: 60
+    guardrail_policy: standard-v1
+    policy_epoch: 1
+    # Deliberately tiny -- M8 smoke-test budget, small enough that a
+    # single real chat/job call exhausts it, so BUDGET_EXCEEDED can be
+    # demonstrated live with one extra curl rather than thousands.
+    monthly_budget: 0.000002
+
+  # Plan section 29's dedicated-tenant-account model: tenant-a/tenant-b
+  # each have their own AWS account (998116076808 / 199013204390,
+  # created 2026-09-17 -- see plan.md section 29). Deliberately kept as
+  # separate tenant_ids from team-a, not merged with it, even though
+  # both use AWS_IAM/SigV4 -- this platform demonstrates two tenancy
+  # models side by side on purpose:
+  #   team-a              -- shared-account multi-tenancy (this account,
+  #                          tiny smoke-test budget, demos BUDGET_EXCEEDED)
+  #   tenant-a / tenant-b -- dedicated-account isolation (their own AWS
+  #                          accounts; no monthly_budget set here since
+  #                          budget enforcement is already covered by
+  #                          team-a, not what these are demonstrating)
+  #
+  # NOT YET REACHABLE: no IAM role exists in either AWS account yet, no
+  # cross-account trust, and no execute-api:Invoke resource policy on
+  # the /iam/* route grants either account access -- see iam_tenants.yaml's
+  # entries for the exact ARNs a role would need. A caller cannot
+  # actually use this path yet; the tenant_id/policy exists so the rest
+  # of the provisioning (IAM role, trust policy, API Gateway resource
+  # policy) has something to point at once that's done.
+  tenant-a:
+    state: ACTIVE
+    models: []   # no restriction beyond the gateway default model
+    rpm_limit: 60
+    guardrail_policy: standard-v1
+    policy_epoch: 1
+
+  tenant-b:
+    state: ACTIVE
+    models: []   # no restriction beyond the gateway default model
+    rpm_limit: 60
+    guardrail_policy: standard-v1
+    policy_epoch: 1

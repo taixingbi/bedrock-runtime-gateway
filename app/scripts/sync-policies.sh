@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# Refreshes policies/ from the canonical platform-policy-definitions repo.
+#
+# Interim mechanism (see policies/*.yaml's banner comment): until the
+# gateway has a working S3/DynamoDB-backed PolicyStore, the Docker image
+# needs a local copy of the policy YAML to bake in at build time. This
+# script is that copy step, run by hand whenever the policies repo
+# changes -- not on a schedule, not in CI. Delete this script (and
+# policies/) once phase 2 lands.
+#
+# Usage:
+#   ./scripts/sync-policies.sh [path-to-platform-policy-definitions-checkout]
+#   (defaults to ../platform-policy-definitions, i.e. a sibling checkout)
+set -euo pipefail
+
+SRC="${1:-../platform-policy-definitions}/environments/dev"
+DST="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/policies"
+
+if [ ! -d "$SRC" ]; then
+  echo "error: $SRC not found -- pass the path to a platform-policy-definitions checkout" >&2
+  exit 1
+fi
+
+for f in tenants.yaml route_sets.yaml iam_tenants.yaml certified_models.yaml model_registry.yaml; do
+  banner=$(sed -n '/^# ====/,/^# ====/p' "$DST/$f")
+  { printf '%s\n' "$banner"; cat "$SRC/$f"; } > "$DST/$f.tmp"
+  mv "$DST/$f.tmp" "$DST/$f"
+  echo "synced $f from $SRC"
+done

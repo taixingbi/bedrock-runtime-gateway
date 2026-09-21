@@ -1,0 +1,558 @@
+"""Assembles the /v1/chat request pipeline (plan section 2):
+
+    Auth -> Tenant/Kill-Switch -> Policy Snapshot -> Rate Limit
+    -> Input Guardrail -> Cache Lookup
+    -> Certified Router (retry+breaker+fallback) -> Bedrock
+    -> Output Guardrail -> Cache Write -> Response
+    -> Telemetry/Cost
+
+Grows one stage per milestone. `api/routes.py` stays a thin HTTP adapter;
+this module holds the actual orchestration logic so each stage is
+unit-testable without going through Starlette's request/response
+machinery.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Callable, Dict, List, Optional, Set
+
+from .auth.aws_iam import IamTenantResolver
+from .auth.enterprise_groups import EnterpriseGroupResolver
+from .auth.identity import AuthError, Identity, identity_from_claims
+from .auth.jwt_verifier import TokenVerifier
+from .authz.decision import Decision, decide
+from .concurrency import ConcurrencyLimiter
+from .guardrails.client import GuardrailClient
+from .guardrails.fail_closed import GuardrailUnavailableError, run_guardrail_check
+from .guardrails.models import GuardrailAction, GuardrailDecision
+from .policy.cache import PolicySnapshotCache
+from .policy.models import BLOCKING_STATES, TenantPolicy, TenantState, UnknownTenantError
+from .policy.rate_limiter import TokenBucketRateLimiter
+from .routing.model_registry import ModelRegistryEntry, ModelStatus, classification_rank, get_status
+from .usage.store import UsageStore, get_application
+
+# THROTTLED tenants get 1/5th their configured rpm_limit rather than being
+# blocked outright -- SUSPENDED/EMERGENCY_BLOCK (the kill switch) is what
+# blocks entirely.
+_THROTTLE_FACTOR = 5
+
+
+class PipelineError(Exception):
+    """A pipeline stage rejected the request. Carries enough to render an
+    HTTP error response without the route handler knowing which stage
+    (auth, kill switch, guardrail, ...) produced it."""
+
+    def __init__(self, status_code: int, code: str, message: str):
+        super().__init__(message)
+        self.status_code = status_code
+        self.code = code
+
+
+def authenticate_iam(
+    principal_arn: str,
+    account_id: Optional[str],
+    *,
+    iam_tenant_resolver: IamTenantResolver,
+    request_id: Optional[str] = None,
+    session_id: Optional[str] = None,
+) -> Identity:
+    """Stage 1 (AWS_IAM path): maps an already SigV4-verified IAM
+    principal ARN to an Identity via `policies/iam_tenants.yaml`.
+
+    `principal_arn` must only ever come from a request that reached this
+    app through API Gateway's AWS_IAM route, which overwrites the
+    x-platform-principal-arn/x-platform-account-id headers with its own
+    verified $context.identity.* values -- see auth/aws_iam.py's module
+    docstring for why that's safe to trust here.
+    """
+    try:
+        grant = iam_tenant_resolver.resolve(principal_arn, request_id=request_id, session_id=session_id)
+    except AuthError as exc:
+        raise PipelineError(403, exc.code, str(exc)) from exc
+
+    return Identity(
+        sub=principal_arn,
+        tenant_id=grant.tenant_id,
+        application_id=grant.application_id,
+        roles=grant.roles,
+        auth_type="aws_iam",
+        account_id=account_id,
+    )
+
+
+def authenticate(
+    authorization_header: Optional[str],
+    *,
+    token_verifier: TokenVerifier,
+    iam_principal_arn: Optional[str] = None,
+    iam_account_id: Optional[str] = None,
+    iam_tenant_resolver: Optional[IamTenantResolver] = None,
+    request_id: Optional[str] = None,
+    session_id: Optional[str] = None,
+    enterprise_group_resolver: Optional[EnterpriseGroupResolver] = None,
+) -> Identity:
+    """Stage 1: Auth. Derives an Identity from whichever verified source
+    the request arrived through.
+
+    If `iam_principal_arn` is set, the caller reached this app through
+    API Gateway's AWS_IAM route (see authenticate_iam's docstring) and
+    that takes precedence -- no bearer token is expected on that route.
+    Otherwise, falls back to the existing JWT path: tenant_id always
+    comes from the verified token's claims, never a request-supplied
+    header (e.g. X-Tenant-ID), so a caller cannot claim a tenant it
+    doesn't hold a token for. `enterprise_group_resolver` (plan section
+    34.2), when configured, lets a real enterprise IdP's `groups` claim
+    resolve to tenant_id/application_id/roles -- see
+    auth/identity.py's identity_from_claims for the precedence order.
+    """
+    if iam_principal_arn:
+        if iam_tenant_resolver is None:
+            raise PipelineError(500, "IAM_AUTH_NOT_CONFIGURED", "aws_iam auth is not configured")
+        return authenticate_iam(
+            iam_principal_arn,
+            iam_account_id,
+            iam_tenant_resolver=iam_tenant_resolver,
+            request_id=request_id,
+            session_id=session_id,
+        )
+
+    if not authorization_header or not authorization_header.startswith("Bearer "):
+        raise PipelineError(401, "UNAUTHENTICATED", "missing bearer token")
+
+    token = authorization_header[len("Bearer "):].strip()
+    if not token:
+        raise PipelineError(401, "UNAUTHENTICATED", "missing bearer token")
+
+    try:
+        claims = token_verifier.verify(token)
+        identity = identity_from_claims(claims, enterprise_group_resolver=enterprise_group_resolver)
+    except AuthError as exc:
+        raise PipelineError(401, exc.code, str(exc)) from exc
+
+    return identity
+
+
+def authorize(identity: Identity, *, required_role: str, action: str = "unspecified") -> Decision:
+    """Stage 1b: RBAC. Raises PipelineError(403, ...) if the identity
+    lacks the role required for this operation. Returns the PDP
+    Decision (plan section 34.3) on success, so a caller that wants to
+    thread decision_id/policy_version into the audit event can."""
+    decision = decide(identity, action=action, required_role=required_role)
+    if not decision.allow:
+        raise PipelineError(403, decision.code, decision.reason)
+    return decision
+
+
+def authorize_any(identity: Identity, *, required_roles: List[str], action: str = "unspecified") -> Decision:
+    """Stage 1b variant: any one of several roles suffices -- e.g. an
+    admin endpoint reachable by either a tenant-scoped manager or a
+    global platform_admin (plan section 30)."""
+    decision = decide(identity, action=action, required_roles=required_roles)
+    if not decision.allow:
+        raise PipelineError(403, decision.code, decision.reason)
+    return decision
+
+
+def authorize_tenant_match(
+    identity: Identity, resource_tenant_id: str, *, override_role: str, action: str = "unspecified",
+    policy_version: Optional[int] = None,
+) -> Decision:
+    """Stage 1b ABAC variant (plan section 30): the identity's own
+    tenant must own `resource_tenant_id`, unless it holds
+    `override_role` (bypasses tenant scoping entirely)."""
+    decision = decide(
+        identity, action=action, resource_tenant_id=resource_tenant_id, override_role=override_role,
+        policy_version=policy_version,
+    )
+    if not decision.allow:
+        raise PipelineError(403, decision.code, decision.reason)
+    return decision
+
+
+def resolve_policy(identity: Identity, *, policy_cache: PolicySnapshotCache) -> TenantPolicy:
+    """Stage 2: Policy Snapshot (plan section 8). Reads through the
+    bounded-TTL, push-invalidated cache -- never a synchronous
+    control-plane call on every request (plan section 9)."""
+    try:
+        return policy_cache.get(identity.tenant_id)
+    except UnknownTenantError as exc:
+        raise PipelineError(403, "TENANT_NOT_PROVISIONED", str(exc)) from exc
+
+
+def enforce_kill_switch(policy: TenantPolicy) -> None:
+    """Stage 3: Emergency Gate (plan section 7). Must run before rate
+    limiting, cache lookup, and routing -- a SUSPENDED/EMERGENCY_BLOCK
+    tenant's request must never reach the model."""
+    if policy.state in BLOCKING_STATES:
+        raise PipelineError(
+            403, "TENANT_BLOCKED", f"tenant '{policy.tenant_id}' is {policy.state.value}"
+        )
+
+
+def enforce_rate_limit(policy: TenantPolicy, *, rate_limiter: TokenBucketRateLimiter) -> None:
+    """Stage 4: Rate Limit, scoped per tenant_id (isolation invariant,
+    plan section 1) so one tenant's burst never throttles another's."""
+    effective_limit = policy.rpm_limit
+    if policy.state == TenantState.THROTTLED:
+        effective_limit = max(1, policy.rpm_limit // _THROTTLE_FACTOR)
+
+    if not rate_limiter.allow(policy.tenant_id, rpm_limit=effective_limit):
+        raise PipelineError(
+            429, "QUOTA_EXCEEDED", f"tenant '{policy.tenant_id}' exceeded its rate limit"
+        )
+
+
+def enforce_concurrency_limit(policy: TenantPolicy, *, concurrency_limiter: ConcurrencyLimiter) -> None:
+    """Stage 4c (plan section 16's concurrency fix): fast-reject, not
+    queue-and-wait -- raises PipelineError(429) immediately if the
+    tenant's or the global slot budget is exhausted. Distinct from
+    enforce_rate_limit: rpm_limit bounds request *rate*, this bounds how
+    many blocking calls (guardrail checks, Bedrock inference) may be
+    in flight for this tenant/globally at once.
+
+    Callers MUST release the acquired slot (concurrency_limiter.release
+    (policy.tenant_id)) once the guarded call finishes, success or
+    failure, or it leaks permanently -- this function only acquires."""
+    if not concurrency_limiter.try_acquire(policy.tenant_id, tenant_max=policy.max_concurrency):
+        raise PipelineError(
+            429, "CONCURRENCY_LIMIT_EXCEEDED",
+            f"tenant '{policy.tenant_id}' exceeded its concurrent-request limit, or the gateway is globally saturated",
+        )
+
+
+def enforce_budget(
+    policy: TenantPolicy,
+    *,
+    usage_store: UsageStore,
+    month: str,
+    day: Optional[str] = None,
+    application_id: Optional[str] = None,
+) -> Optional[str]:
+    """Stage 4b: FinOps budget (M8, plan section 20; extended by plan
+    section 34.7). None means unlimited -- most tenants don't opt in.
+    Checked before the model is ever called; the actual spend increment
+    happens only after a successful response (api/routes.py / jobs/
+    processor.py), not here, so a request that itself fails or is
+    blocked never counts against the budget it was checked against.
+
+    Three hard caps (any exceeded -> 429 BUDGET_EXCEEDED), checked in
+    order: monthly (M8, unchanged), daily (`day`/`policy.daily_budget`
+    required together -- either omitted skips it), per-application
+    (`application_id`/`policy.application_budgets[application_id]`
+    required together). A soft *warning* (not a block) is returned --
+    not raised -- when monthly spend crosses
+    `monthly_budget_soft_threshold_pct`, same "return a string for the
+    caller to log" shape enforce_model_certification's CONDITIONAL
+    warning already uses.
+    """
+    warning: Optional[str] = None
+
+    if policy.monthly_budget is not None:
+        monthly_spend = usage_store.get(policy.tenant_id, month)
+        if monthly_spend >= policy.monthly_budget:
+            raise PipelineError(
+                429,
+                "BUDGET_EXCEEDED",
+                f"tenant '{policy.tenant_id}' exceeded its monthly budget (${policy.monthly_budget:.2f})",
+            )
+        if policy.monthly_budget_soft_threshold_pct is not None:
+            threshold = policy.monthly_budget * policy.monthly_budget_soft_threshold_pct
+            if monthly_spend >= threshold:
+                warning = (
+                    f"tenant '{policy.tenant_id}' crossed "
+                    f"{policy.monthly_budget_soft_threshold_pct:.0%} of its monthly budget "
+                    f"(${monthly_spend:.2f} / ${policy.monthly_budget:.2f})"
+                )
+
+    if policy.daily_budget is not None and day is not None:
+        daily_spend = usage_store.get(policy.tenant_id, day)
+        if daily_spend >= policy.daily_budget:
+            raise PipelineError(
+                429,
+                "DAILY_BUDGET_EXCEEDED",
+                f"tenant '{policy.tenant_id}' exceeded its daily budget (${policy.daily_budget:.2f})",
+            )
+
+    if application_id is not None and application_id in policy.application_budgets:
+        app_budget = policy.application_budgets[application_id]
+        app_spend = get_application(usage_store, policy.tenant_id, application_id, month)
+        if app_spend >= app_budget:
+            raise PipelineError(
+                429,
+                "APPLICATION_BUDGET_EXCEEDED",
+                f"application '{application_id}' (tenant '{policy.tenant_id}') exceeded its "
+                f"monthly budget (${app_budget:.2f})",
+            )
+
+    return warning
+
+
+@dataclass(frozen=True)
+class AdmissionDecision:
+    """Plan section 34.6: one reported decision covering kill-switch,
+    rate-limit, and budget admission, instead of three separate
+    raise-or-continue calls a caller has to individually catch. Does
+    NOT change enforcement behavior -- admission_decision() below
+    calls the exact same enforce_kill_switch/enforce_rate_limit/
+    enforce_budget functions, in the same order, so this is a
+    reporting wrapper, not a second enforcement path that could drift
+    from the first."""
+
+    allowed: bool
+    stage: Optional[str] = None  # "kill_switch" | "rate_limit" | "budget", None if allowed
+    error: Optional[PipelineError] = None
+    warning: Optional[str] = None  # enforce_budget's soft-threshold warning, if any
+
+
+def admission_decision(
+    policy: TenantPolicy,
+    *,
+    rate_limiter: TokenBucketRateLimiter,
+    usage_store: UsageStore,
+    month: str,
+    day: Optional[str] = None,
+    application_id: Optional[str] = None,
+) -> AdmissionDecision:
+    """Stages 3-4b run together: kill-switch, rate limit, budget (see
+    module docstring's pipeline diagram). Concurrency (stage 4c) is
+    deliberately NOT included here -- it's acquired per-blocking-call
+    around the guardrail/inference calls themselves (api/routes.py's
+    _run_blocking_limited), not upfront at admission time, since the
+    slot must be held only as long as the actual blocking work runs."""
+    try:
+        enforce_kill_switch(policy)
+    except PipelineError as exc:
+        return AdmissionDecision(allowed=False, stage="kill_switch", error=exc)
+
+    try:
+        enforce_rate_limit(policy, rate_limiter=rate_limiter)
+    except PipelineError as exc:
+        return AdmissionDecision(allowed=False, stage="rate_limit", error=exc)
+
+    try:
+        warning = enforce_budget(
+            policy, usage_store=usage_store, month=month, day=day, application_id=application_id
+        )
+    except PipelineError as exc:
+        return AdmissionDecision(allowed=False, stage="budget", error=exc)
+
+    return AdmissionDecision(allowed=True, warning=warning)
+
+
+def enforce_model_allowlist(
+    policy: TenantPolicy, *, requested_model: Optional[str], default_model: str
+) -> str:
+    """Resolves the model to invoke. An explicit request for a model
+    outside the tenant's allowlist is rejected; an empty allowlist means
+    "no restriction beyond the gateway default" so existing tenants don't
+    need a models: list to keep working."""
+    if requested_model is not None:
+        if policy.models and requested_model not in policy.models:
+            raise PipelineError(
+                403,
+                "MODEL_NOT_ALLOWED",
+                f"model '{requested_model}' is not in tenant '{policy.tenant_id}' allowlist",
+            )
+        return requested_model
+
+    if policy.models:
+        return policy.models[0]
+    return default_model
+
+
+def enforce_model_certification(
+    model_id: str,
+    *,
+    certified_model_ids: Set[str],
+    model_registry: Optional[Dict[str, ModelRegistryEntry]] = None,
+    tenant_data_classification: Optional[str] = None,
+    fail_closed: bool = False,
+) -> Optional[str]:
+    """Stage 4c: Routing Invariant (M9, plan sections 1 and 13). A model
+    that hasn't passed evaluation/certification (evals/run_eval.py,
+    policies/certified_models.yaml) must never receive production
+    traffic -- checked here for the primary before the router is ever
+    called; routing/router.py's CertifiedRouter separately filters
+    fallback candidates against the same registry, so a certified
+    primary can't fall back to an uncertified model either.
+
+    Plan section 34.5: `model_registry`, when supplied, is a second,
+    independent check -- a model can be in `certified_model_ids`
+    (passed the eval gate once) yet BLOCKED/DEPRECATED in the registry
+    (governance decided to retire it since); the registry wins. A
+    CONDITIONAL model is still allowed to route -- this returns a
+    warning string instead of raising, for the caller to log, rather
+    than silently swallowing it.
+
+    Plan section 34.4b: `tenant_data_classification`, when supplied
+    alongside a registry entry with a resolvable
+    `max_data_classification`, rejects a model whose data-handling
+    ceiling is lower than the tenant's own classification (e.g. a PHI
+    tenant routed at a model only cleared for INTERNAL data).
+
+    Plan section 35.3 (P0 production hardening): `fail_closed`
+    (Settings.model_governance_fail_closed, opt-in per environment)
+    changes two defaults from permissive to restrictive: (1) a model
+    absent from the registry entirely is BLOCKED, not APPROVED (see
+    routing/model_registry.py's `get_status`); (2) a *present* but
+    unresolvable classification value (a real typo/unknown string, not
+    simply "tenant hasn't opted into classification at all" --
+    `tenant_data_classification is None` is a legitimate no-requirement
+    case in both modes) is rejected rather than silently skipped. Off
+    by default -- correct for a migration phase where introducing
+    model_registry.yaml/data_classification shouldn't retroactively
+    block every pre-existing tenant/model that hasn't been curated
+    into them yet; a real prod rollout should turn this on once the
+    registry is actually curated.
+    """
+    if model_id not in certified_model_ids:
+        raise PipelineError(
+            403,
+            "MODEL_NOT_CERTIFIED",
+            f"model '{model_id}' has not passed certification (see evals/run_eval.py)",
+        )
+
+    if model_registry is None:
+        return None
+
+    entry = model_registry.get(model_id)
+    status = get_status(model_id, registry=model_registry, fail_closed=fail_closed)
+
+    if status in (ModelStatus.BLOCKED, ModelStatus.DEPRECATED):
+        reason = (
+            f"model '{model_id}' is {status.value} in the model registry (plan section 34.5)"
+            if entry is not None
+            else f"model '{model_id}' has no model registry entry (fail-closed, plan section 35.3)"
+        )
+        raise PipelineError(403, "MODEL_NOT_APPROVED", reason)
+
+    if entry is not None and entry.max_data_classification is not None:
+        model_rank = classification_rank(entry.max_data_classification)
+        tenant_rank = classification_rank(tenant_data_classification)
+
+        if fail_closed and model_rank is None:
+            raise PipelineError(
+                403, "MODEL_DATA_CLASSIFICATION_UNRESOLVABLE",
+                f"model '{model_id}' has an unrecognized max_data_classification "
+                f"'{entry.max_data_classification}' (fail-closed, plan section 35.3)",
+            )
+        if fail_closed and tenant_data_classification is not None and tenant_rank is None:
+            raise PipelineError(
+                403, "TENANT_DATA_CLASSIFICATION_UNRESOLVABLE",
+                f"tenant data_classification '{tenant_data_classification}' is unrecognized "
+                f"(fail-closed, plan section 35.3)",
+            )
+        if model_rank is not None and tenant_rank is not None and tenant_rank > model_rank:
+            raise PipelineError(
+                403,
+                "DATA_CLASSIFICATION_EXCEEDS_MODEL_LIMIT",
+                f"model '{model_id}' is only approved for data up to "
+                f"'{entry.max_data_classification}', tenant requires "
+                f"'{tenant_data_classification}' (plan section 34.4b)",
+            )
+
+    if status == ModelStatus.CONDITIONAL:
+        return f"model '{model_id}' is CONDITIONAL in the model registry: {entry.notes or 'no notes'}"
+    return None
+
+
+def enforce_resource_authorization(
+    identity: Identity,
+    *,
+    action: str,
+    resource_id: str,
+    resource_type: str = "model",
+    context: Optional[Dict[str, object]] = None,
+    iam_tenant_resolver: Optional[IamTenantResolver] = None,
+    request_id: Optional[str] = None,
+    session_id: Optional[str] = None,
+) -> None:
+    """Stage 4d (plan section 35.16, P2 production hardening): the
+    resource/context-aware half of centralized authorization that
+    Stage 1's identity resolution could never provide, since the model
+    isn't resolved yet at that point (see auth/aws_iam.py's
+    HttpIamTenantResolver.resolve() and check_resource_access()
+    docstrings, and platform-authz-service's policy_engine.py, which
+    documented this exact gap before this function existed). Called
+    from routes.py/jobs_routes.py right after
+    enforce_model_certification, once `resource_id` (the resolved
+    model) and `context` (e.g. the tenant's data_classification) are
+    both known.
+
+    Only fires for an AWS_IAM-authenticated identity whose
+    iam_tenant_resolver actually talks to platform-authz-service --
+    `check_resource_access` is duck-typed via getattr, not a Protocol
+    method every IamTenantResolver must implement, since
+    Layered/File/DynamoDb resolvers are pure identity-mapping lookups
+    with no PDP behind them (same "structural, not a hard dependency"
+    shape as this codebase's DynamoDb concurrency/rate-limiter drop-
+    ins). A no-op when absent -- identical behavior to before this
+    function existed, not a new hard requirement on authz-service.
+
+    JWT-path identities (identity.auth_type == "jwt") are deliberately
+    NOT checked here: platform-authz-service's AuthorizeRequest.identity
+    is `Literal["aws_iam"]`-only today (see its models.py) and its
+    server-side resolution re-derives tenant_id/roles from an IAM
+    principal ARN specifically -- a JWT-path identity has no such ARN.
+    Extending this to JWT-path callers needs a real schema change on
+    that service's side; a separate, not-yet-scoped follow-up, not
+    assumed here.
+    """
+    checker = getattr(iam_tenant_resolver, "check_resource_access", None)
+    if identity.auth_type != "aws_iam" or checker is None:
+        return
+    decision = checker(
+        identity.sub,
+        action=action,
+        resource_id=resource_id,
+        resource_type=resource_type,
+        context=context,
+        request_id=request_id,
+        session_id=session_id,
+    )
+    if not decision.allow:
+        raise PipelineError(403, "RESOURCE_ACCESS_DENIED", decision.reason)
+
+
+def check_input_guardrail(
+    text: str, *, policy: TenantPolicy, guardrail_client: GuardrailClient
+) -> GuardrailDecision:
+    """Stage 5: Input Guardrail (plan sections 10-11). Raises
+    PipelineError on BLOCK (400) or on fail-closed unavailability (503,
+    AI_SAFETY_SERVICE_UNAVAILABLE) -- the model is never called in either
+    case."""
+    decision = _run_guardrail(
+        lambda: guardrail_client.check_input(text, guardrail_policy=policy.guardrail_policy),
+        policy=policy,
+    )
+    if decision.action == GuardrailAction.BLOCK:
+        raise PipelineError(400, "INPUT_BLOCKED", decision.reason or "input blocked by guardrail")
+    return decision
+
+
+def check_output_guardrail(
+    text: str, *, policy: TenantPolicy, guardrail_client: GuardrailClient
+) -> GuardrailDecision:
+    """Stage 6 (post-Bedrock): Output Guardrail. A blocked completion is
+    never returned to the caller (502, OUTPUT_BLOCKED) -- same
+    fail-closed contract as the input side."""
+    decision = _run_guardrail(
+        lambda: guardrail_client.check_output(text, guardrail_policy=policy.guardrail_policy),
+        policy=policy,
+    )
+    if decision.action == GuardrailAction.BLOCK:
+        raise PipelineError(502, "OUTPUT_BLOCKED", decision.reason or "output blocked by guardrail")
+    return decision
+
+
+def _run_guardrail(
+    check: Callable[[], GuardrailDecision], *, policy: TenantPolicy
+) -> GuardrailDecision:
+    try:
+        return run_guardrail_check(
+            check,
+            guardrail_policy=policy.guardrail_policy,
+            allow_bypass_on_error=policy.allow_guardrail_bypass_on_error,
+        )
+    except GuardrailUnavailableError as exc:
+        raise PipelineError(503, "AI_SAFETY_SERVICE_UNAVAILABLE", str(exc)) from exc

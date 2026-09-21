@@ -1,0 +1,51 @@
+# ============================================================
+# COPY -- not the source of truth. Canonical copy lives in
+# github.com/taixingbi/platform-policy-definitions (environments/dev/).
+# Sync by running scripts/sync-policies.sh against a checkout of
+# that repo. This copy exists only so `docker build` here keeps
+# working during the app/infra/policies repo split -- once the
+# gateway has a working S3/DynamoDB-backed PolicyStore, this
+# directory and the COPY step in Dockerfile go away entirely.
+# ============================================================
+# Certified route sets (M4, plan section 13). A tenant's fallback
+# candidates always come from here -- never an arbitrary model a client
+# might request. Referenced by tenant policy's `route_set` field (see
+# policies/tenants.yaml).
+#
+# Being listed here is necessary but not sufficient: every primary/
+# fallback model must also be in certified_models.yaml (M9, plan
+# section 21) -- validate.py checks that at commit time,
+# routing/router.py's CertifiedRouter enforces it at runtime by
+# filtering any model not certified out of the candidate list.
+#
+# Fallback order: cheapest/same-family first (nova-lite), then two
+# different model providers for real outage diversity (llama3.3-70b,
+# qwen3-32b), then the priciest/most-capable as a last resort
+# (nova-pro) -- not a quality ranking, a "how bad does it have to get
+# before we pay more" ordering (see routing/router.py's fallback
+# semantics).
+#
+# deepseek-r1 (us.deepseek.r1-v1:0) was evaluated and deliberately left
+# out: it answers entirely via a `reasoningContent` block, not `text`,
+# and never reaches a final answer within the golden dataset harness's
+# 128-token budget (stopReason: max_tokens) -- a real harness/model-
+# family mismatch, not a capability gap worth hiding. Needs a
+# reasoning-model-aware eval path (larger token budget, extracting
+# reasoningContent) before it can be fairly certified.
+
+route_sets:
+  finance-chat-v1:
+    primary: us.amazon.nova-micro-v1:0
+    fallbacks:
+      - us.amazon.nova-lite-v1:0
+      - us.meta.llama3-3-70b-instruct-v1:0
+      - qwen.qwen3-32b-v1:0
+      - us.amazon.nova-pro-v1:0
+
+  search-chat-v1:
+    primary: us.amazon.nova-micro-v1:0
+    fallbacks:
+      - us.amazon.nova-lite-v1:0
+      - us.meta.llama3-3-70b-instruct-v1:0
+      - qwen.qwen3-32b-v1:0
+      - us.amazon.nova-pro-v1:0

@@ -1,0 +1,93 @@
+name: "Infra: Promote to prod"
+
+# Deliberately separate from infra-ci.yml's push trigger, same shape
+# as app-promote-prod.yml: a prod apply is an explicit action someone
+# takes after dev already applied cleanly, never an automatic side
+# effect of pushing to main.
+#
+# Unlike the app half of this repo, this can't "promote the same
+# bytes" -- dev and prod are different Terraform resources
+# (gateway-dev-cluster vs gateway-prod-cluster, etc), so promotion
+# here means re-running plan/apply against infra/environments/prod
+# for a specific commit, not copying dev's state. commit_sha is
+# required (not "whatever main is right now") so that what dev
+# validated is provably what prod plans and applies -- main can move
+# on to a new commit in between without silently changing what a
+# pending prod promotion would deploy.
+
+on:
+  workflow_dispatch:
+    inputs:
+      commit_sha:
+        description: >
+          Full commit SHA that already applied cleanly to dev (see a
+          successful "apply (dev)" run in the Infra CI workflow for
+          this SHA). Both plan and apply below check out exactly this
+          commit's infra/environments/prod -- never "whatever main is
+          right now".
+        required: true
+        type: string
+
+jobs:
+  plan-prod:
+    name: plan (prod) @ ${{ inputs.commit_sha }}
+    runs-on: ubuntu-latest
+    environment: plan
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.commit_sha }}
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_INFRA_PLAN_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.9"
+
+      - name: terraform init
+        working-directory: infra/environments/prod
+        run: terraform init -input=false
+
+      - name: terraform plan
+        working-directory: infra/environments/prod
+        run: terraform plan -input=false -lock=false
+
+  apply-prod:
+    name: apply (prod) @ ${{ inputs.commit_sha }}
+    needs: plan-prod
+    runs-on: ubuntu-latest
+    # Required reviewers on this GitHub Environment are the real human
+    # checkpoint here -- separate from, and in addition to,
+    # workflow_dispatch already requiring someone with write access to
+    # have started this run in the first place.
+    environment: apply-prod
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.commit_sha }}
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_INFRA_APPLY_PROD_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.9"
+
+      - name: terraform init
+        working-directory: infra/environments/prod
+        run: terraform init -input=false
+
+      - name: terraform apply
+        working-directory: infra/environments/prod
+        run: terraform apply -input=false -auto-approve

@@ -1,0 +1,41 @@
+[tool.poetry]
+name = "bedrock-gateway-platform"
+version = "0.1.0"
+description = "Multi-tenant enterprise LLM gateway on AWS Bedrock"
+authors = []
+readme = "README.md"
+packages = [{ include = "services" }, { include = "loadtests" }, { include = "evals" }]
+
+[tool.poetry.dependencies]
+python = ">=3.11,<3.13"
+fastapi = ">=0.115,<1.0"
+# fastapi itself only requires starlette>=0.46.0, no upper bound, so
+# a plain `poetry lock` can land on an old resolved version with real
+# CVEs (0.52.1 had 5 -- host-header/path-authority confusion, form()
+# DoS, unauthenticated method dispatch -- fixed across 1.0.1 to
+# 1.3.1). pip-audit caught this live; forcing a floor here, matching
+# what platform-authz-service's own independent lock already landed
+# on for the same fastapi version.
+starlette = ">=1.6.0,<2.0"
+pydantic = ">=2.0,<3.0"
+uvicorn = ">=0.38,<1.0"
+boto3 = ">=1.34,<2.0"
+pyjwt = { version = ">=2.8,<3.0", extras = ["crypto"] }
+pyyaml = ">=6.0,<7.0"
+opentelemetry-api = ">=1.20,<2.0"
+opentelemetry-sdk = ">=1.20,<2.0"
+opentelemetry-exporter-otlp-proto-http = ">=1.20,<2.0"
+
+[tool.poetry.group.dev.dependencies]
+httpx = ">=0.28,<1.0"
+pytest = ">=9.0.3,<10.0"
+locust = ">=2.20,<3.0"
+# Real DynamoDB emulation for DynamoDbConcurrencyLimiter/
+# DynamoDbRateLimiter tests (plan section 35.2) -- deliberately NOT a
+# hand-rolled call-recording fake, since these classes' whole point is
+# getting DynamoDB's conditional-transaction semantics right.
+moto = { version = ">=5.0,<6.0", extras = ["dynamodb"] }
+
+[build-system]
+requires = ["poetry-core>=2.0,<3.0"]
+build-backend = "poetry.core.masonry.api"

@@ -33,12 +33,27 @@ resource "aws_sns_topic" "ops_alerts" {
   }
 }
 
-module "network" {
-  source = "../../modules/network"
+# Plan section 3 (2026-09-21): the VPC/subnets moved to
+# platform-foundation -- looked up by name here, same loose-coupling
+# convention as every other cross-repo lookup in this platform
+# (data.aws_lb.authz below, platform-authz-service's own ALB lookup,
+# etc.), rather than a module reference. This repo no longer owns any
+# part of the network's lifecycle.
+data "aws_vpc" "foundation" {
+  tags = {
+    Name = "${local.name_prefix}-vpc"
+  }
+}
 
-  name_prefix = local.name_prefix
-  environment = "dev"
-  aws_region  = var.aws_region
+data "aws_subnets" "foundation_private" {
+  filter {
+    name   = "vpc-id"
+    values = [data.aws_vpc.foundation.id]
+  }
+  filter {
+    name   = "tag:Name"
+    values = ["${local.name_prefix}-private-*"]
+  }
 }
 
 module "ecr" {
@@ -55,7 +70,7 @@ module "ecr" {
 # it as ingress regardless of which repo created it.
 data "aws_security_group" "api_gateway_vpc_link" {
   name   = "${local.name_prefix}-api-gw-vpc-link"
-  vpc_id = module.network.vpc_id
+  vpc_id = data.aws_vpc.foundation.id
 }
 
 # Plan section 36: authz_service's own Terraform (ECS/ALB/ECR) moved
@@ -75,8 +90,8 @@ module "ecs_service" {
   name_prefix                = local.name_prefix
   environment                = "dev"
   aws_region                 = var.aws_region
-  vpc_id                     = module.network.vpc_id
-  private_subnet_ids         = module.network.private_subnet_ids
+  vpc_id                     = data.aws_vpc.foundation.id
+  private_subnet_ids         = data.aws_subnets.foundation_private.ids
   vpc_link_security_group_id = data.aws_security_group.api_gateway_vpc_link.id
   log_group_name             = "/ai-platform/ecs/bedrock-gateway-dev"
   # Plan section 35.5 -- same shared internal Private CA
@@ -720,8 +735,8 @@ module "worker_service" {
   name_prefix        = "${local.name_prefix}-worker"
   environment        = "dev"
   aws_region         = var.aws_region
-  vpc_id             = module.network.vpc_id
-  private_subnet_ids = module.network.private_subnet_ids
+  vpc_id             = data.aws_vpc.foundation.id
+  private_subnet_ids = data.aws_subnets.foundation_private.ids
   cluster_name       = module.ecs_service.cluster_name
   log_group_name     = "/ai-platform/ecs/bedrock-gateway-worker-dev"
 

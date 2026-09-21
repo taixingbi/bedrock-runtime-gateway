@@ -25,7 +25,7 @@ jobs:
 
       - uses: hashicorp/setup-terraform@v3
         with:
-          terraform_version: "1.9"
+          terraform_version: "1.16.1"
 
       - name: terraform fmt -check
         run: terraform fmt -check -recursive infra
@@ -63,7 +63,7 @@ jobs:
 
       - uses: hashicorp/setup-terraform@v3
         with:
-          terraform_version: "1.9"
+          terraform_version: "1.16.1"
 
       - name: terraform init
         working-directory: infra/environments/${{ matrix.environment }}
@@ -121,7 +121,7 @@ jobs:
 
       - uses: hashicorp/setup-terraform@v3
         with:
-          terraform_version: "1.9"
+          terraform_version: "1.16.1"
 
       - name: terraform init
         working-directory: infra/environments/dev

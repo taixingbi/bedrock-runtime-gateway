@@ -138,6 +138,10 @@ data "aws_iam_policy_document" "infra_plan" {
       # and the ACM cert it issues.
       "acm-pca:Describe*", "acm-pca:Get*", "acm-pca:List*",
       "acm:Describe*", "acm:Get*", "acm:List*",
+      # mTLS client cert delivery (plan section 35): refreshing
+      # aws_secretsmanager_secret/secret_version state.
+      "secretsmanager:DescribeSecret", "secretsmanager:GetSecretValue",
+      "secretsmanager:ListSecretVersionIds", "secretsmanager:ListSecrets",
       "application-autoscaling:Describe*", "application-autoscaling:ListTagsForResource",
       "cloudwatch:Describe*", "cloudwatch:List*", "cloudwatch:Get*",
       "sns:GetTopicAttributes", "sns:ListTagsForResource", "sns:ListTopics",
@@ -217,6 +221,14 @@ data "aws_iam_policy_document" "infra_apply" {
   statement {
     sid       = "AcmBroad"
     actions   = ["acm:*"]
+    resources = ["*"]
+  }
+  # mTLS client cert delivery (plan section 35): secret names don't
+  # exist until creation, same reasoning as every other broad grant
+  # above -- not scopable ahead of time.
+  statement {
+    sid       = "SecretsManagerBroad"
+    actions   = ["secretsmanager:*"]
     resources = ["*"]
   }
 

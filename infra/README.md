@@ -3,9 +3,9 @@
 Terraform for everything the `app/` half of this repo (and its
 sibling services in other repos) run on: VPC/networking (private
 subnets + NAT + gateway VPC endpoints), ALBs, ECS/Fargate (gateway,
-authz, worker, portal services, each with autoscaling), ECR, IAM/OIDC
-(for every repo in the platform, not just this one), Cognito (portal
-login), CloudWatch alarms + SNS, and a KMS CMK for audit data.
+authz, worker services, each with autoscaling), ECR, this repo's own
+CI/OIDC roles (`ci_identity/`), CloudWatch alarms + SNS, and a KMS CMK
+for audit data.
 
 History: originally split out of the combined `bedrock-gateway-platform`
 repo so an app deploy never needed Terraform permissions and a
@@ -28,27 +28,38 @@ modules/
   authz_service/    platform-authz-service's own ECS cluster/ALB/service (dev only today --
                     not yet deployed to prod, see plan.md section 35)
   worker_service/   M7 async-jobs worker's ECS service, SQS-backlog-driven autoscaling
-  portal_service/   bedrock-gateway-portal's ECS service
-  portal_cdn/       CloudFront distribution in front of the portal
-  cognito_idp/      Cognito user pool + Hosted UI backing the portal's login
-  github_oidc/      Generic: OIDC provider + N IAM roles trusting N {repo, GitHub Environment} pairs
 environments/
-  global/           Account-wide: the OIDC provider + every role for every repo in the platform
   dev/              gateway-dev: every service above, applied and live
   prod/             gateway-prod: mirrors dev's Terraform, but NOT auto-applied (see below) and
-                    missing authz_service/portal TLS pending real decisions (plan.md section 35)
+                    missing authz_service TLS pending real decisions (plan.md section 35)
+ci_identity/        This repo's own CI/OIDC roles (app deploy-dev/prod, infra
+                    plan/apply-dev/apply-prod) -- own state, own (infrequent) apply. See
+                    its own main.tf header for the 2026-09-21 Terraform-ownership
+                    migration that moved these out of platform-foundation.
 ```
 
-## Why this repo owns IAM/OIDC for every repo in the platform
+## Terraform-ownership migration (2026-09-21) -- IAM/OIDC and portal/Cognito both moved out
 
-`modules/github_oidc` is generic -- it knows how to create an OIDC
-role trusting a given `{repo, GitHub Environment}` pair, and nothing
-about what that role is allowed to do. `environments/global` calls it
-once per repo in the platform (app, infra's own plan/apply, policies'
-publish, portal, platform-authz-service, platform-edge-gateway).
-Centralizing this here (rather than each repo owning its own OIDC
-role) means every permission grant in the whole platform is reviewable
-in one Terraform diff, not scattered across every repo's own history.
+This repo used to centralize IAM/OIDC for the whole platform
+(`modules/github_oidc`, called once per repo from a `environments/
+global` this repo owned) and to own the self-service portal's infra
+(`modules/portal_service`/`portal_cdn`/`cognito_idp`). Both have since
+moved to their real long-term owners, and this repo's own copies of
+all four modules were deleted (not just superseded) once nothing
+referenced them any more:
+
+- **IAM/OIDC**: the account-wide OIDC provider now lives permanently
+  in `platform-foundation` (`module.github_oidc_foundation`); every
+  repo, this one included, owns its own CI roles in its own
+  `ci_identity/` root (see this repo's own `ci_identity/main.tf`),
+  migrated via `terraform import` -- ARNs never changed.
+- **Portal/Cognito**: `platform-control-plane` owns the real, live
+  `portal_service`/`portal_cdn`/`cognito_idp` modules and the actual
+  running portal today. `environments/dev/main.tf` here hardcodes the
+  few Cognito values the gateway app still needs (`OIDC_JWKS_URL`/
+  `OIDC_ISSUER`/`OIDC_AUDIENCE`) rather than referencing a module --
+  see that block's own comment for why a hardcode beats a fragile
+  data-source lookup here.
 
 **What this still deliberately does not include:** a real IdP for the
 JWT path (the app still falls back to its dev JWT keypair until one is
@@ -71,8 +82,8 @@ current list of what's built versus what's a pending decision.
 away with local state since only one person ever ran `terraform
 apply`), this repo's CI needs shared, lockable state --
 `backend.tf.example` -> `backend.tf` (S3 bucket + DynamoDB lock table)
-in each of `environments/{global,dev,prod}/` is **required**, not
-optional, before wiring up this repo's CI:
+in each of `environments/{dev,prod}/` and `ci_identity/` is
+**required**, not optional, before wiring up this repo's CI:
 
 ```bash
 aws s3api create-bucket --bucket <your-tfstate-bucket> --region us-east-1
@@ -84,53 +95,48 @@ aws dynamodb create-table --table-name <your-tfstate-lock-table> \
 
 Then `terraform init -migrate-state` in each environment.
 
-**2. Apply `environments/global`.** Creates the GitHub OIDC provider
-(account-wide singleton) and every role across every repo in the platform:
+**2. Apply `platform-foundation` first, account-wide.** The GitHub
+OIDC provider (account-wide singleton) now lives there, not here --
+see that repo's own README for its one-time bootstrap. Every repo's
+own `ci_identity/` (this one included) only ever references that
+provider via data source; none of them can create their own roles
+until it exists.
+
+**3. Apply this repo's own `ci_identity/`.** Creates the 5 roles this
+repo's own CI needs (`gha-app-deploy-{dev,prod}`,
+`gha-infra-{plan,apply-dev,apply-prod}`):
 
 ```bash
-cd environments/global
+cd ci_identity
 terraform init
 terraform apply -var="github_org=<your-github-org-or-username>"
 ```
 
 Note the role ARNs in the output -- **this is the chicken-and-egg
-step**: this repo's own `gha-infra-plan`/`gha-infra-apply` roles don't
-exist until this first local apply creates them, so this repo's CI
-can't be the thing that creates them. Every apply after this first one
-can run through CI.
+step**: these roles don't exist until this first local apply creates
+them, so this repo's own CI can't be the thing that creates them.
+Every apply after this first one can run through CI (`ci_identity`
+auto-applies on push to `main`, same as `environments/dev`).
 
-**3. Create the GitHub Environments.** In this repo (bedrock-runtime-gateway):
-- `dev`, `prod` -- app/ half's deploy roles (`app-ci.yml`/`app-promote-prod.yml`):
-  set `AWS_APP_DEPLOY_ROLE_ARN_DEV`/`_PROD`.
-- `plan`, `apply-dev`, `apply-prod` -- infra/ half's own Terraform roles
-  (`infra-ci.yml`/`infra-promote-prod.yml`): set `AWS_INFRA_PLAN_ROLE_ARN`/
-  `AWS_INFRA_APPLY_{DEV,PROD}_ROLE_ARN`. `apply-dev` auto-applies on every
-  push to `main`; `apply-prod` is never auto-applied from CI (see "hold
-  prod" note below) -- add required reviewers regardless.
+**4. Create this repo's GitHub Environments**: `dev`, `prod` (app/
+half's deploy roles, `app-ci.yml`/`app-promote-prod.yml`) -- set
+`AWS_APP_DEPLOY_ROLE_ARN_DEV`/`_PROD`; `plan`, `apply-dev`, `apply-prod`
+(infra/ half's own Terraform roles, `infra-ci.yml`/
+`infra-promote-prod.yml`) -- set `AWS_INFRA_PLAN_ROLE_ARN`/
+`AWS_INFRA_APPLY_{DEV,PROD}_ROLE_ARN`. `apply-dev` auto-applies on
+every push to `main`; `apply-prod` is never auto-applied from CI (see
+"hold prod" note below) -- add required reviewers regardless.
 
-  Every OTHER repo in the platform needs its own analogous Environments,
-  all pointing at roles this repo's `environments/global/main.tf` defines:
-- platform-policy-definitions: `publish` -- set `AWS_POLICY_PUBLISH_ROLE_ARN`
-  (the role exists but is inert -- that repo's CI has no publish job yet
-  and the role's own DynamoDB target is a placeholder table name; see
-  platform-policy-definitions's own README for the current state).
-- bedrock-gateway-portal: `dev`, `prod` -- set `AWS_PORTAL_DEPLOY_ROLE_ARN_DEV`/`_PROD`.
-  Being superseded by platform-control-plane's own `dev` Environment/portal
-  deploy role.
-- platform-authz-service: `dev`, `prod`, plus its own `plan`/`apply-dev` for
-  its own Terraform -- set `AWS_AUTHZ_DEPLOY_ROLE_ARN_DEV`/`_PROD` and
-  `AWS_AUTHZ_INFRA_{PLAN,APPLY_DEV}_ROLE_ARN`.
-- platform-edge-gateway: `plan`, `apply-dev`, `apply-prod` -- its own
-  OIDC roles, defined in this repo's `environments/global/main.tf`
-  under `github_oidc_api_gateway`.
-- platform-control-plane: `dev` (portal deploy), plus `plan`/`apply-dev`
-  for its own `infra/` -- set `AWS_PORTAL_DEPLOY_ROLE_ARN_DEV` and
-  `AWS_CONTROL_PLANE_INFRA_{PLAN,APPLY_DEV}_ROLE_ARN`.
+Every other repo in the platform bootstraps its own CI identity the
+same way, in its own `ci_identity/` (or, for `platform-foundation`
+itself, `environments/global/`) -- see each repo's own README for its
+specific roles and GitHub Environment variables; this repo no longer
+defines or documents any of them.
 
 Restrict each Environment's deployment branches to `main` as a second
 layer behind each workflow's own branch check.
 
-**4. Apply `environments/dev` and `environments/prod`.** Same as
+**5. Apply `environments/dev` and `environments/prod`.** Same as
 before the split -- creates/confirms the VPC, ECR repo, ECS
 cluster/service, ALB, and API Gateway for each. If migrating from the
 combined repo, this should show **zero changes** (same resource
@@ -151,10 +157,9 @@ touch any real infrastructure.
   ECS task role `bedrock:InvokeModel`/`InvokeModelWithResponseStream`
   on exactly those models/inference profiles. Keep it in sync with
   whatever `route_sets.yaml` says in platform-policy-definitions.
-- The `gha-infra-apply` role's IAM/EC2/ELBv2/ECS/ECR/API-Gateway
+- The `gha-infra-apply-{dev,prod}` roles' IAM/EC2/ELBv2/ECS/ECR
   permissions are intentionally broad-but-name-scoped rather than
   minimal -- most of these services don't support resource-level IAM
   scoping on creation actions (a VPC/ALB/etc. ARN doesn't exist until
-  after it's created). See the comment in
-  `environments/global/main.tf` above `data.aws_iam_policy_document.infra_apply`
-  before tightening it further.
+  after it's created). See the comment in `ci_identity/main.tf` above
+  its own apply policy documents before tightening it further.

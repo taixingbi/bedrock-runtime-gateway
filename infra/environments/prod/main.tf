@@ -569,32 +569,9 @@ module "worker_service" {
   }
 }
 
-# --- M10: self-service portal ---------------------------------------------
-
-module "ecr_portal" {
-  source = "../../modules/ecr"
-
-  repository_name = "${local.name_prefix}-portal"
-  environment     = "prod"
-}
-
-module "portal_service" {
-  source = "../../modules/portal_service"
-
-  name_prefix        = "${local.name_prefix}-portal"
-  environment        = "prod"
-  aws_region         = var.aws_region
-  vpc_id             = module.network.vpc_id
-  private_subnet_ids = module.network.private_subnet_ids
-  log_group_name     = "/ai-platform/ecs/bedrock-gateway-portal-prod"
-
-  image = "${module.ecr_portal.repository_url}:bootstrap"
-
-  container_env = {
-    # Placeholder -- platform-edge-gateway's environments/prod hasn't
-    # been applied yet (prod is held). Replace with its real
-    # api_endpoint output once it has, same as environments/dev/main.tf
-    # already does.
-    GATEWAY_API_URL = "https://not-yet-applied.invalid"
-  }
-}
+# --- M10: self-service portal -- moved to platform-control-plane
+# (Phase 1 of the platform restructuring, portal/cognito infra
+# ownership). See that repo's own infra/environments/prod for the
+# real module block; environments/dev/main.tf here has carried no
+# portal_service/ecr_portal reference for the same reason since the
+# actual cutover -- prod's copy just hadn't been cleaned up yet.

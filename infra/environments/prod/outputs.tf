@@ -34,8 +34,3 @@ output "worker_service_name" {
 output "usage_table_name" {
   value = aws_dynamodb_table.usage.name
 }
-
-output "portal_url" {
-  description = "HTTP only (MVP, no TLS yet) -- the M10 self-service portal."
-  value       = "http://${module.portal_service.alb_dns_name}"
-}

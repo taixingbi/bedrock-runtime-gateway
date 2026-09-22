@@ -51,6 +51,28 @@ resource "aws_security_group" "alb" {
     }
   }
 
+  # Added by hand 2026-09-22 for the gateway-principal-grants-dev
+  # DynamoDB rename's manual verification -- lets a console-launched
+  # AWS CloudShell VPC environment (attached to gateway-dev-vpc,
+  # security group sg-0c25b89ac47694f02) reach this ALB for ad hoc
+  # curl/debugging. Declared here (not just created via the CLI) so a
+  # routine dev auto-apply doesn't revert it as drift.
+  ingress {
+    description     = "CloudShell VPC environment - manual curl/debugging"
+    from_port       = 80
+    to_port         = 80
+    protocol        = "tcp"
+    security_groups = ["sg-0c25b89ac47694f02"]
+  }
+
+  ingress {
+    description     = "CloudShell VPC environment - manual curl/debugging (HTTPS)"
+    from_port       = 443
+    to_port         = 443
+    protocol        = "tcp"
+    security_groups = ["sg-0c25b89ac47694f02"]
+  }
+
   egress {
     from_port   = 0
     to_port     = 0

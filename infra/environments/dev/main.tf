@@ -631,7 +631,15 @@ resource "aws_dynamodb_table" "provisioned_tenant_policies" {
 # reasoning as provisioned_tenant_policies above, for the AWS_IAM/SigV4
 # auth path (see auth/aws_iam.py's LayeredIamTenantResolver).
 resource "aws_dynamodb_table" "provisioned_principal_mappings" {
-  name         = "${local.name_prefix}-provisioned-principal-mappings"
+  # Renamed 2026-09-22 from gateway-dev-provisioned-principal-mappings --
+  # deliberately not local.name_prefix-derived like every sibling table
+  # here, per this rename's explicit request. Data migrated via a
+  # create-new/copy-items/cut-over/decommission-old sequence (never a
+  # destroy+recreate -- DynamoDB's `name` is ForceNew, which would have
+  # dropped all 12 live onboarded grants); this resource's Terraform
+  # state was re-pointed at the new table via `state rm` + `import`,
+  # never applied as a replace.
+  name         = "gateway-principal-grants-dev"
   billing_mode = "PAY_PER_REQUEST"
   hash_key     = "principal_arn"
 

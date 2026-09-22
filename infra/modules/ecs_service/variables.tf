@@ -126,6 +126,20 @@ variable "container_env" {
   default     = {}
 }
 
+# mTLS cutover (plan section 35): the client cert/key gateway-api
+# presents to authz-service's ALB shouldn't be a plain container_env
+# value (CloudWatch Logs / `aws ecs describe-task-definition` would
+# both expose a private key in plaintext) -- ECS resolves each of
+# these from Secrets Manager at container start and injects it as a
+# real environment variable the running process reads, same end
+# result as container_env from the app's own point of view, but never
+# persisted in the task definition or logs.
+variable "container_secrets" {
+  description = "Environment variables resolved from Secrets Manager at container start -- map of env var name to secret ARN (a full ARN, or ARN:jsonKey for one field of a JSON secret)."
+  type        = map(string)
+  default     = {}
+}
+
 variable "bedrock_model_ids" {
   description = "Model/inference-profile IDs the task role may invoke, matching policies/route_sets.yaml (e.g. \"us.amazon.nova-micro-v1:0\")."
   type        = list(string)

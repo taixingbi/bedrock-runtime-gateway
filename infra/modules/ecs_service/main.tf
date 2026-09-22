@@ -210,6 +210,32 @@ resource "aws_iam_role_policy_attachment" "execution" {
   policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
 }
 
+# The execution role (not the task role) is what actually resolves
+# container_secrets at container start -- ECS Agent assumes this role
+# to call secretsmanager:GetSecretValue, before the app itself ever
+# runs. Scoped to exactly the ARNs this call site passed in, not a
+# broad secretsmanager:* grant.
+data "aws_iam_policy_document" "execution_secrets" {
+  count = length(var.container_secrets) > 0 ? 1 : 0
+
+  statement {
+    sid     = "ReadContainerSecrets"
+    actions = ["secretsmanager:GetSecretValue"]
+    # A container_secrets value may be a full ARN, or ARN:jsonKey for
+    # one field of a JSON secret -- either way, IAM authorizes against
+    # the base secret ARN, so always take just the first 7 ":"-separated
+    # segments (arn:aws:secretsmanager:region:account:secret:name).
+    resources = distinct([for arn in values(var.container_secrets) : join(":", slice(split(":", arn), 0, 7))])
+  }
+}
+
+resource "aws_iam_role_policy" "execution_secrets" {
+  count  = length(var.container_secrets) > 0 ? 1 : 0
+  name   = "${var.name_prefix}-execution-secrets-read"
+  role   = aws_iam_role.execution.id
+  policy = data.aws_iam_policy_document.execution_secrets[0].json
+}
+
 # What the running application is allowed to do: call Bedrock. Nothing else.
 resource "aws_iam_role" "task" {
   name               = "${var.name_prefix}-task"
@@ -535,6 +561,9 @@ resource "aws_ecs_task_definition" "this" {
       ]
       environment = [
         for k, v in var.container_env : { name = k, value = v }
+      ]
+      secrets = [
+        for k, v in var.container_secrets : { name = k, valueFrom = v }
       ]
       logConfiguration = {
         logDriver = "awslogs"

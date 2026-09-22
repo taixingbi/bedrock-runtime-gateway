@@ -5,6 +5,10 @@ terraform {
       source  = "hashicorp/aws"
       version = "~> 5.0"
     }
+    tls = {
+      source  = "hashicorp/tls"
+      version = "~> 4.0"
+    }
   }
 }
 
@@ -14,6 +18,15 @@ provider "aws" {
 
 locals {
   name_prefix = "gateway-dev"
+
+  # Plan section 35.5 -- the shared internal Private CA, owned by
+  # platform-foundation (Phase 3c, 2026-09-21). Hardcoded, not a
+  # resource reference -- ACM PCA has no clean "look up by name" data
+  # source, and this ARN is stable for the CA's lifetime. Update this
+  # if the CA is ever destroyed and recreated (a new one gets a new
+  # ARN) -- see platform-foundation's own environments/dev for the
+  # owning resource.
+  private_ca_arn = "arn:aws:acm-pca:us-east-1:646821141010:certificate-authority/328ba585-7400-4565-bad3-6bfda5c0196d"
 }
 
 # --- Plan section 35's P1 hardening: operational alarms -----------------
@@ -84,6 +97,59 @@ data "aws_lb" "authz" {
   name = "${local.name_prefix}-authz-alb"
 }
 
+# --- mTLS client certificate for calling authz-service (plan section
+# 35, P1 production hardening) -------------------------------------
+#
+# Issued from the same private CA authz-service's own ALB listener
+# cert comes from (local.private_ca_arn) -- ACM PCA only ever sees the
+# CSR (a public key + identity); the private key is generated here and
+# never leaves this Terraform run except into Secrets Manager
+# (encrypted at rest), read by the running container via
+# container_secrets below, never written to the task definition or
+# CloudWatch Logs in plaintext.
+resource "tls_private_key" "authz_client" {
+  algorithm = "RSA"
+  rsa_bits  = 2048
+}
+
+resource "tls_cert_request" "authz_client" {
+  private_key_pem = tls_private_key.authz_client.private_key_pem
+
+  subject {
+    common_name = "gateway-api.internal"
+  }
+}
+
+resource "aws_acmpca_certificate" "authz_client" {
+  certificate_authority_arn   = local.private_ca_arn
+  certificate_signing_request = tls_cert_request.authz_client.cert_request_pem
+  signing_algorithm           = "SHA256WITHRSA"
+  template_arn                = "arn:aws:acm-pca:::template/EndEntityClientAuthCertificate/V1"
+
+  validity {
+    type  = "YEARS"
+    value = 1
+  }
+}
+
+resource "aws_secretsmanager_secret" "authz_client_cert" {
+  name = "${local.name_prefix}-authz-client-cert"
+}
+
+resource "aws_secretsmanager_secret_version" "authz_client_cert" {
+  secret_id     = aws_secretsmanager_secret.authz_client_cert.id
+  secret_string = aws_acmpca_certificate.authz_client.certificate
+}
+
+resource "aws_secretsmanager_secret" "authz_client_key" {
+  name = "${local.name_prefix}-authz-client-key"
+}
+
+resource "aws_secretsmanager_secret_version" "authz_client_key" {
+  secret_id     = aws_secretsmanager_secret.authz_client_key.id
+  secret_string = tls_private_key.authz_client.private_key_pem
+}
+
 module "ecs_service" {
   source = "../../modules/ecs_service"
 
@@ -95,13 +161,9 @@ module "ecs_service" {
   vpc_link_security_group_id = data.aws_security_group.api_gateway_vpc_link.id
   log_group_name             = "/ai-platform/ecs/bedrock-gateway-dev"
   # Plan section 35.5 -- same shared internal Private CA
-  # platform-authz-service's own ALB HTTPS listener uses. Hardcoded,
-  # not a resource reference: the CA moved to platform-foundation
-  # (Phase 3c, 2026-09-21) -- same convention platform-authz-service's
-  # own local.private_ca_arn already used before this move (ACM PCA
-  # has no clean "look up by name" data source). Update this if the CA
-  # is ever destroyed and recreated (a new one gets a new ARN).
-  private_ca_arn = "arn:aws:acm-pca:us-east-1:646821141010:certificate-authority/328ba585-7400-4565-bad3-6bfda5c0196d"
+  # platform-authz-service's own ALB HTTPS listener uses (local.private_ca_arn
+  # above, also used by this file's own mTLS client-cert resources below).
+  private_ca_arn = local.private_ca_arn
   sns_topic_arn  = aws_sns_topic.ops_alerts.arn
 
   # No image has been pushed on a first apply -- CI registers the real
@@ -234,6 +296,16 @@ module "ecs_service" {
     OIDC_JWKS_URL = "https://cognito-idp.us-east-1.amazonaws.com/us-east-1_HvCI4Nbr6/.well-known/jwks.json"
     OIDC_ISSUER   = "https://cognito-idp.us-east-1.amazonaws.com/us-east-1_HvCI4Nbr6"
     OIDC_AUDIENCE = "3g1ahkm9un6ccfno3e2jtt53j8"
+  }
+
+  # mTLS cutover (plan section 35): the client cert/key gateway-api
+  # presents to authz-service's ALB -- resolved from Secrets Manager at
+  # container start, injected as a real env var HttpIamTenantResolver
+  # reads the same way it already reads AUTHZ_CA_CERT_PEM above, never
+  # persisted in the task definition or CloudWatch Logs.
+  container_secrets = {
+    AUTHZ_CLIENT_CERT_PEM = aws_secretsmanager_secret.authz_client_cert.arn
+    AUTHZ_CLIENT_KEY_PEM  = aws_secretsmanager_secret.authz_client_key.arn
   }
 }
 

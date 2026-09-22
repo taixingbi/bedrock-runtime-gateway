@@ -162,10 +162,93 @@ resource "aws_lb_listener" "https" {
   ssl_policy        = "ELBSecurityPolicy-TLS13-1-2-2021-06"
   certificate_arn   = aws_acm_certificate.this.arn
 
+  # mTLS cutover (2026-09-22, plan section 35): mode is "off" until
+  # both real callers (gateway-api, platform-control-plane's backend)
+  # are confirmed presenting a valid client cert -- flipping straight
+  # to "verify" before that would reject every request on this
+  # service's only synchronous call path with no fallback. The AWS
+  # provider REJECTS trust_store_arn (and every other mutual_authentication
+  # argument) unless mode is exactly "verify" -- confirmed against the
+  # provider schema, not guessed at -- so aws_lb_trust_store.this below
+  # is created now but deliberately left unreferenced here until that
+  # cutover.
+  mutual_authentication {
+    mode = "off"
+  }
+
   default_action {
     type             = "forward"
     target_group_arn = aws_lb_target_group.this.arn
   }
+}
+
+# --- mTLS trust store (plan section 35, P1 production hardening) -----
+#
+# Client certs (gateway-api's, control-plane backend's -- each issued
+# from this same private CA, see each repo's own environments/dev's
+# client-cert resources) are verified against this bundle once
+# aws_lb_listener.https's mutual_authentication is flipped to "verify".
+# The bundle only needs this CA's own certificate -- both client certs
+# chain directly to it, no intermediate.
+#
+# Hardcoded, not a data-source lookup: same "root CA cert is stable for
+# its lifetime, update by hand if the CA is ever destroyed/recreated"
+# convention this platform already uses for AUTHZ_CA_CERT_PEM in both
+# gateway-api's and control-plane's own environments/dev/main.tf.
+resource "aws_s3_bucket" "trust_store" {
+  bucket = "${var.name_prefix}-mtls-trust-store"
+}
+
+# Required by aws_lb_trust_store -- ALB reads the CA bundle by a
+# specific object version, not just "latest".
+resource "aws_s3_bucket_versioning" "trust_store" {
+  bucket = aws_s3_bucket.trust_store.id
+  versioning_configuration {
+    status = "Enabled"
+  }
+}
+
+resource "aws_s3_bucket_public_access_block" "trust_store" {
+  bucket                  = aws_s3_bucket.trust_store.id
+  block_public_acls       = true
+  block_public_policy     = true
+  ignore_public_acls      = true
+  restrict_public_buckets = true
+}
+
+resource "aws_s3_object" "ca_bundle" {
+  bucket = aws_s3_bucket.trust_store.id
+  key    = "ca-bundle.pem"
+  content = chomp(<<-EOT
+    -----BEGIN CERTIFICATE-----
+    MIIDKzCCAhOgAwIBAgIRAJI2amN73dXcl32YjkCVK5swDQYJKoZIhvcNAQELBQAw
+    LzEtMCsGA1UEAwwkQmVkcm9jayBHYXRld2F5IFBsYXRmb3JtIEludGVybmFsIENB
+    MB4XDTI2MDkxNzAxNDMyNVoXDTM2MDkxNzAyNDMyNVowLzEtMCsGA1UEAwwkQmVk
+    cm9jayBHYXRld2F5IFBsYXRmb3JtIEludGVybmFsIENBMIIBIjANBgkqhkiG9w0B
+    AQEFAAOCAQ8AMIIBCgKCAQEAop+Y1RxTXoOTZVrIgFurEINkEbE/E1/JQjHesTMX
+    2zuFmgQAJtmsLRHnEpJDPRSWjcbdZCVbhSsfNGt7gNXIw32pPTbPOx02BoHUVaFS
+    MbNaw6t0TRvsuWTCrJCTRIoS595xrUSz1jFuwIMgpzJH7C0u6OoMEI+YrU6WYOhX
+    pKsT5AQrVf7e6BaRX4IeyOZRK8A7ACq0NqrgVDv+gmq8ggnAWZyMBsSscozkOfZO
+    FK+fnsK2xdSiDvvoBOiN2wC3zx6ZyTqzN0zsAaqq9hQby3y2GD/FDyIq4MIYSsqR
+    YlhWJp5HL+BVnJ66sn9MqnKbNUEM3EI71DVX5wzGzvpCUwIDAQABo0IwQDAPBgNV
+    HRMBAf8EBTADAQH/MB0GA1UdDgQWBBREKqAldQXFXQVILzNgPFMgmKAHMDAOBgNV
+    HQ8BAf8EBAMCAYYwDQYJKoZIhvcNAQELBQADggEBAHnic2MRaOxmzBWU4/A1hYmq
+    tdipEjk2BXt3uOUOkbiPn3lYneZCcQIUfSrDP65d+3+5aTPV2oVGU93zc+YrUwjN
+    QSQWYP0QrXWBa2ZOAou354Jg5je1ydVRZi2QdnIuIEkHdbkY10zAy8b4ojc75tDE
+    vmJoVAJhXQnjiLl0NeR0rPY4cTdPKnZ+Wphb2cl8hEGzYr6s7TMQvbPjzB0HrnFX
+    OTDWYTh2wY7wKxcWzp1rlgul/jH1Kek4eBtG3u3F/2R8MBxYfI5XzOyoWayzXVd5
+    LrdHmzHQfP2eEv9GqS54Gqu3elV3dOdluK0rbmYfrUcVGOoFI3DFBFLD01agWe0=
+    -----END CERTIFICATE-----
+  EOT
+  )
+}
+
+resource "aws_lb_trust_store" "this" {
+  name                             = "${var.name_prefix}-mtls-trust"
+  ca_certificates_bundle_s3_bucket = aws_s3_bucket.trust_store.id
+  ca_certificates_bundle_s3_key    = aws_s3_object.ca_bundle.key
+
+  depends_on = [aws_s3_bucket_versioning.trust_store]
 }
 
 data "aws_iam_policy_document" "ecs_assume" {

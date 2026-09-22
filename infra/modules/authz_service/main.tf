@@ -162,18 +162,20 @@ resource "aws_lb_listener" "https" {
   ssl_policy        = "ELBSecurityPolicy-TLS13-1-2-2021-06"
   certificate_arn   = aws_acm_certificate.this.arn
 
-  # mTLS cutover (2026-09-22, plan section 35): mode is "off" until
-  # both real callers (gateway-api, platform-control-plane's backend)
-  # are confirmed presenting a valid client cert -- flipping straight
-  # to "verify" before that would reject every request on this
-  # service's only synchronous call path with no fallback. The AWS
-  # provider REJECTS trust_store_arn (and every other mutual_authentication
-  # argument) unless mode is exactly "verify" -- confirmed against the
-  # provider schema, not guessed at -- so aws_lb_trust_store.this below
-  # is created now but deliberately left unreferenced here until that
-  # cutover.
+  # mTLS cutover (2026-09-22, plan section 35): flipped to "verify"
+  # only after confirming both real callers (gateway-api,
+  # platform-control-plane's backend) load a valid client cert without
+  # error -- ssl.SSLContext.load_cert_chain() (HttpIamTenantResolver's
+  # own constructor) raises immediately on a malformed or mismatched
+  # cert/key pair, so both services actually reaching "Application
+  # startup complete" post-deploy is real, load-bearing confirmation,
+  # not an assumption. A caller with no client cert at all (e.g. the
+  # CloudShell VPC debug ingress from earlier manual testing) now
+  # fails the TLS handshake -- intended, not a regression: that's what
+  # mutual auth enforcement means.
   mutual_authentication {
-    mode = "off"
+    mode            = "verify"
+    trust_store_arn = aws_lb_trust_store.this.arn
   }
 
   default_action {

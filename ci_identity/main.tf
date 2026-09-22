@@ -139,9 +139,13 @@ data "aws_iam_policy_document" "infra_plan" {
       "acm-pca:Describe*", "acm-pca:Get*", "acm-pca:List*",
       "acm:Describe*", "acm:Get*", "acm:List*",
       # mTLS client cert delivery (plan section 35): refreshing
-      # aws_secretsmanager_secret/secret_version state.
+      # aws_secretsmanager_secret/secret_version state -- GetResourcePolicy
+      # is a distinct action from DescribeSecret, called separately to
+      # check for a resource-based policy on the secret (learned live:
+      # DescribeSecret alone still 403s on this one).
       "secretsmanager:DescribeSecret", "secretsmanager:GetSecretValue",
       "secretsmanager:ListSecretVersionIds", "secretsmanager:ListSecrets",
+      "secretsmanager:GetResourcePolicy",
       "application-autoscaling:Describe*", "application-autoscaling:ListTagsForResource",
       "cloudwatch:Describe*", "cloudwatch:List*", "cloudwatch:Get*",
       "sns:GetTopicAttributes", "sns:ListTagsForResource", "sns:ListTopics",

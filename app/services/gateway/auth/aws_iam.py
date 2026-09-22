@@ -305,9 +305,30 @@ class HttpIamTenantResolver:
     store knows about, so the default `ssl` behavior would reject it.
     Empty means "use the system default" (plain HTTP in dev/tests, or
     an environment that hasn't set this up).
+
+    `client_cert_pem`/`client_key_pem`, when both set, present this
+    service's own mTLS client identity on every call -- plan section
+    35's P1 hardening. Stage 1 only (2026-09-22): authz-service's ALB
+    trust store exists but its listener's mutual_authentication is
+    still `mode = "off"`, so presenting a cert here is harmless and
+    unverified until that's flipped to "verify" -- see
+    modules/authz_service's own comment on why that cutover is
+    deliberately separate. Either both are empty (no client cert
+    presented, today's default) or both are set together; one without
+    the other would fail at `load_cert_chain` with a confusing OpenSSL
+    error rather than a clear config mistake, so this only ever writes
+    files when both are present.
     """
 
-    def __init__(self, *, base_url: str, timeout_s: float = 5.0, ca_cert_pem: str = ""):
+    def __init__(
+        self,
+        *,
+        base_url: str,
+        timeout_s: float = 5.0,
+        ca_cert_pem: str = "",
+        client_cert_pem: str = "",
+        client_key_pem: str = "",
+    ):
         self._base_url = base_url.rstrip("/")
         self._timeout_s = timeout_s
         self._ssl_context = None
@@ -315,6 +336,24 @@ class HttpIamTenantResolver:
             import ssl
 
             self._ssl_context = ssl.create_default_context(cadata=ca_cert_pem)
+            if client_cert_pem and client_key_pem:
+                # ssl.SSLContext.load_cert_chain has no in-memory/string
+                # form (unlike create_default_context's own cadata=
+                # above) -- both PEMs have to land on disk somewhere it
+                # can open them. A private temp dir this process owns
+                # for its own lifetime, never written before this call,
+                # key file mode 0600 -- about as close to "never really
+                # at rest" as the stdlib ssl module allows.
+                import tempfile
+                from pathlib import Path
+
+                cert_dir = Path(tempfile.mkdtemp(prefix="authz-mtls-"))
+                cert_path = cert_dir / "client.crt"
+                key_path = cert_dir / "client.key"
+                cert_path.write_text(client_cert_pem)
+                key_path.write_text(client_key_pem)
+                key_path.chmod(0o600)
+                self._ssl_context.load_cert_chain(certfile=str(cert_path), keyfile=str(key_path))
 
     def _post_authorize(
         self,

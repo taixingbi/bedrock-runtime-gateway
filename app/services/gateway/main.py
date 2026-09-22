@@ -156,7 +156,12 @@ def create_app(
         # when it's configured, this app defers principal-mapping
         # entirely rather than doing it twice.
         iam_tenant_resolver = (
-            HttpIamTenantResolver(base_url=settings.authz_service_url, ca_cert_pem=settings.authz_ca_cert_pem)
+            HttpIamTenantResolver(
+                base_url=settings.authz_service_url,
+                ca_cert_pem=settings.authz_ca_cert_pem,
+                client_cert_pem=settings.authz_client_cert_pem,
+                client_key_pem=settings.authz_client_key_pem,
+            )
             if settings.authz_service_url
             else LayeredIamTenantResolver(
                 primary=iam_tenant_resolver_primary,

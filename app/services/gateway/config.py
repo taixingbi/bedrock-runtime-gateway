@@ -192,6 +192,17 @@ class Settings:
     # system default (fine for plain HTTP in dev/tests).
     authz_ca_cert_pem: str
 
+    # Plan section 35 (P1 hardening) -- this service's own mTLS client
+    # cert/key, presented to authz-service on every call once its ALB
+    # listener's mutual_authentication is flipped to "verify" (still
+    # "off" as of 2026-09-22, see HttpIamTenantResolver's own comment).
+    # Both empty -> no client cert presented (today's default); set
+    # together from Secrets Manager in real environments, never as a
+    # plain container_env value (infra/modules/ecs_service's own
+    # container_secrets).
+    authz_client_cert_pem: str
+    authz_client_key_pem: str
+
 
 def load_settings() -> Settings:
     return Settings(
@@ -257,4 +268,6 @@ def load_settings() -> Settings:
         ),
         authz_service_url=os.environ.get("AUTHZ_SERVICE_URL", ""),
         authz_ca_cert_pem=os.environ.get("AUTHZ_CA_CERT_PEM", ""),
+        authz_client_cert_pem=os.environ.get("AUTHZ_CLIENT_CERT_PEM", ""),
+        authz_client_key_pem=os.environ.get("AUTHZ_CLIENT_KEY_PEM", ""),
     )

@@ -384,6 +384,62 @@ class HttpIamTenantResolverTests(unittest.TestCase):
 
         self.assertIsNone(resolver._ssl_context)
 
+    def test_client_cert_and_key_pem_load_cert_chain(self):
+        """Plan section 35's P1 hardening -- once both are set,
+        HttpIamTenantResolver presents this service's own mTLS client
+        identity on every call. ssl.SSLContext.load_cert_chain has no
+        in-memory form, so this asserts on the files it's forced to
+        write instead of the PEM strings directly."""
+        from unittest.mock import MagicMock, patch
+
+        from ..auth.aws_iam import HttpIamTenantResolver
+
+        mock_context = MagicMock()
+        with patch("ssl.create_default_context", return_value=mock_context):
+            HttpIamTenantResolver(
+                base_url="https://authz.internal",
+                ca_cert_pem="-----BEGIN CERTIFICATE-----\nfake-ca\n-----END CERTIFICATE-----",
+                client_cert_pem="-----BEGIN CERTIFICATE-----\nfake-cert\n-----END CERTIFICATE-----",
+                client_key_pem="-----BEGIN PRIVATE KEY-----\nfake-key\n-----END PRIVATE KEY-----",
+            )
+
+        mock_context.load_cert_chain.assert_called_once()
+        certfile = mock_context.load_cert_chain.call_args.kwargs["certfile"]
+        keyfile = mock_context.load_cert_chain.call_args.kwargs["keyfile"]
+        with open(certfile) as f:
+            self.assertIn("fake-cert", f.read())
+        with open(keyfile) as f:
+            self.assertIn("fake-key", f.read())
+
+    def test_client_cert_without_key_does_not_load_cert_chain(self):
+        """Half-configured (one of the pair set, not both) is treated as
+        not configured at all -- see the class docstring on why a
+        partial config shouldn't fail with a confusing OpenSSL error."""
+        from unittest.mock import MagicMock, patch
+
+        from ..auth.aws_iam import HttpIamTenantResolver
+
+        mock_context = MagicMock()
+        with patch("ssl.create_default_context", return_value=mock_context):
+            HttpIamTenantResolver(
+                base_url="https://authz.internal",
+                ca_cert_pem="fake-ca",
+                client_cert_pem="fake-cert-only",
+            )
+
+        mock_context.load_cert_chain.assert_not_called()
+
+    def test_no_client_cert_pem_means_no_load_cert_chain(self):
+        from unittest.mock import MagicMock, patch
+
+        from ..auth.aws_iam import HttpIamTenantResolver
+
+        mock_context = MagicMock()
+        with patch("ssl.create_default_context", return_value=mock_context):
+            HttpIamTenantResolver(base_url="https://authz.internal", ca_cert_pem="fake-ca")
+
+        mock_context.load_cert_chain.assert_not_called()
+
     def test_pinned_context_is_passed_to_urlopen(self):
         import io
         from unittest.mock import patch

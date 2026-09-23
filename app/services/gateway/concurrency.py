@@ -308,6 +308,52 @@ class DynamoDbConcurrencyLimiter:
         }
 
 
+async def try_acquire_with_wait(
+    concurrency_limiter: Any,
+    tenant_id: str,
+    *,
+    tenant_max: Optional[int],
+    max_wait_s: float,
+    poll_interval_s: float = 0.1,
+    clock: Optional[Callable[[], float]] = None,
+    sleep: Optional[Callable[[float], Any]] = None,
+) -> Optional[str]:
+    """The 'Queue' state in this platform's own Admit/Queue/Reject
+    admission vocabulary, applied to the synchronous /v1/chat path --
+    TenantPolicy.queue_enabled opts a tenant into this instead of the
+    fast-reject default (try_acquire alone). Not a real message queue
+    (that's the separate, client-chosen /v1/jobs SQS path, M7): this
+    polls try_acquire on the SAME request/connection, giving a slot
+    that frees up mid-request a chance to admit this one instead of
+    immediately 429ing.
+
+    Bounded, not unbounded -- still gives up and returns None (the
+    caller 429s exactly as it always has) once max_wait_s elapses, so a
+    tenant that opts into queueing can slow other requests down for at
+    most that long, never block forever behind a stuck backend.
+
+    `clock`/`sleep` are injectable (default to time.monotonic/
+    asyncio.sleep) so tests can drive this without real wall-clock
+    waits -- same "injectable clock" convention as
+    TokenBucketRateLimiter.
+    """
+    import time as time_module
+
+    if clock is None:
+        clock = time_module.monotonic
+    if sleep is None:
+        sleep = asyncio.sleep
+
+    deadline = clock() + max_wait_s
+    while True:
+        lease = concurrency_limiter.try_acquire(tenant_id, tenant_max=tenant_max)
+        if lease:
+            return lease
+        if clock() >= deadline:
+            return None
+        await sleep(poll_interval_s)
+
+
 class BlockingCallTimeoutError(Exception):
     pass
 

@@ -31,7 +31,7 @@ from ..auth.enterprise_groups import EnterpriseGroupResolver
 from ..auth.jwt_verifier import TokenVerifier
 from ..cache.keys import build_cache_key, normalize_messages
 from ..cache.store import CachedResponse, ResponseCache
-from ..concurrency import BlockingCallRunner, BlockingCallTimeoutError, ConcurrencyLimiter
+from ..concurrency import BlockingCallRunner, BlockingCallTimeoutError, ConcurrencyLimiter, try_acquire_with_wait
 from ..config import Settings
 from ..guardrails.client import GuardrailClient
 from ..inference.bedrock_client import BedrockChatMessage, BedrockInvocationError
@@ -86,14 +86,32 @@ def build_router(
 ) -> APIRouter:
     api_router = APIRouter()
 
-    async def _run_blocking_limited(tenant_id: str, tenant_max, func, *args, **kwargs):
+    async def _run_blocking_limited(tenant_policy, func, *args, **kwargs):
         """Plan section 16's concurrency fix: acquire a fast-reject slot
         (tenant + global), run `func` off the event loop with a total
         timeout, always release the slot after -- whatever `func` itself
         raises (guardrail BLOCK, BedrockInvocationError, ...) propagates
         to the caller unchanged; this only adds admission control and
-        thread offload around it."""
-        lease_token = concurrency_limiter.try_acquire(tenant_id, tenant_max=tenant_max)
+        thread offload around it.
+
+        `tenant_policy` (not `policy` -- every call site also forwards
+        its own `policy=policy` kwarg through **kwargs to `func` itself,
+        e.g. pipeline.check_input_guardrail; naming both the same
+        collides as "multiple values for argument 'policy'", caught
+        live by this file's own test suite) opts a tenant into a
+        bounded wait-and-retry for a slot instead of the immediate 429
+        via its queue_enabled field -- see
+        concurrency.try_acquire_with_wait's own docstring for why this
+        is a queue in this platform's Admit/Queue/Reject vocabulary,
+        not a real message queue."""
+        tenant_id = tenant_policy.tenant_id
+        if tenant_policy.queue_enabled:
+            lease_token = await try_acquire_with_wait(
+                concurrency_limiter, tenant_id,
+                tenant_max=tenant_policy.max_concurrency, max_wait_s=tenant_policy.queue_max_wait_s,
+            )
+        else:
+            lease_token = concurrency_limiter.try_acquire(tenant_id, tenant_max=tenant_policy.max_concurrency)
         if not lease_token:
             raise pipeline.PipelineError(
                 429, "CONCURRENCY_LIMIT_EXCEEDED",
@@ -284,7 +302,7 @@ def build_router(
             guardrail_start = time.perf_counter()
             try:
                 await _run_blocking_limited(
-                    identity.tenant_id, policy.max_concurrency,
+                    policy,
                     pipeline.check_input_guardrail,
                     combined_input_text, policy=policy, guardrail_client=guardrail_client,
                 )
@@ -429,7 +447,7 @@ def build_router(
             start = time.perf_counter()
             try:
                 routed = await _run_blocking_limited(
-                    identity.tenant_id, policy.max_concurrency,
+                    policy,
                     router.converse,
                     primary_model_id=model_id,
                     route_set_name=policy.route_set,
@@ -484,7 +502,7 @@ def build_router(
             guardrail_start = time.perf_counter()
             try:
                 await _run_blocking_limited(
-                    identity.tenant_id, policy.max_concurrency,
+                    policy,
                     pipeline.check_output_guardrail,
                     result.text, policy=policy, guardrail_client=guardrail_client,
                 )

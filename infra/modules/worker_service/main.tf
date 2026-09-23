@@ -101,31 +101,41 @@ data "aws_iam_policy_document" "task" {
     resources = local.bedrock_model_arns
   }
 
-  # Long-poll and delete only -- no SendMessage (that's gateway-api's
-  # job, see modules/ecs_service's jobs_access policy), and no
-  # ChangeMessageVisibility beyond what ReceiveMessage's own
-  # VisibilityTimeout already provides for a single-attempt worker.
+  # Heartbeat visibility while this worker owns a job; no enqueue permission.
   statement {
     sid       = "ConsumeJobs"
-    actions   = ["sqs:ReceiveMessage", "sqs:DeleteMessage", "sqs:GetQueueAttributes"]
+    actions   = ["sqs:ReceiveMessage", "sqs:DeleteMessage", "sqs:GetQueueAttributes", "sqs:ChangeMessageVisibility"]
     resources = [var.sqs_queue_arn]
   }
 
   statement {
-    # PutItem, not UpdateItem: jobs/store.py's DynamoDbJobStore.put()
-    # always does a full put_item overwrite (both the initial create by
-    # gateway-api and every status transition here), never an
-    # UpdateItem-style partial update.
+    # Conditional claim/renew use UpdateItem; fenced terminal writes use PutItem.
     sid       = "JobRecords"
-    actions   = ["dynamodb:GetItem", "dynamodb:PutItem"]
+    actions   = ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:UpdateItem"]
     resources = [var.dynamodb_table_arn]
   }
 
   statement {
     sid       = "UsageRecords"
-    actions   = ["dynamodb:UpdateItem"]
+    actions   = ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:UpdateItem"]
     resources = [var.usage_table_arn]
   }
+  statement {
+    sid       = "TenantPolicies"
+    actions   = ["dynamodb:GetItem"]
+    resources = [var.tenant_policies_table_arn]
+  }
+  statement {
+    sid       = "AdmissionControl"
+    actions   = ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:UpdateItem", "dynamodb:DeleteItem", "dynamodb:Scan"]
+    resources = [var.admission_control_table_arn]
+  }
+  statement {
+    sid       = "Guardrails"
+    actions   = ["bedrock:ApplyGuardrail"]
+    resources = [var.guardrail_arn]
+  }
+
 }
 
 resource "aws_iam_role_policy" "task" {

@@ -30,7 +30,7 @@ class BedrockThrottlingScenarioTests(unittest.IsolatedAsyncioTestCase):
         fake = ThrottlingFaultConverseClient(throttle_rate=1.0)  # every call throttles
         breaker = CircuitBreaker(failure_threshold=failure_threshold, reset_timeout_s=3600.0)
         scenario = build_scenario_app(
-            tenants={"finance": default_tenant_policy("finance", rpm_limit=10_000)},
+            tenants={"tenant1-finance": default_tenant_policy("tenant1-finance", rpm_limit=10_000)},
             converse_client=fake,
             guardrail_client=AlwaysAllowGuardrailClient(),
             circuit_breaker=breaker,
@@ -40,7 +40,7 @@ class BedrockThrottlingScenarioTests(unittest.IsolatedAsyncioTestCase):
             return await scenario.client.post(
                 "/v1/chat",
                 json={"messages": [{"role": "user", "content": "hi"}]},
-                headers=scenario.auth_header(tenant_id="finance"),
+                headers=scenario.auth_header(tenant_id="tenant1-finance"),
             )
 
         try:

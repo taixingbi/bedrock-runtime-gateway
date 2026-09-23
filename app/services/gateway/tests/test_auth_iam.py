@@ -35,7 +35,12 @@ class _FakeIamTenantResolver:
 
 
 def _resolver() -> _FakeIamTenantResolver:
-    grant = IamPrincipalGrant(tenant_id="team-a", application_id="team-a-ai-client", roles=["developer"])
+    # tenant_id must be one of the 3 real tenants (tenants.yaml) --
+    # ChatEndpointIamAuthTests below runs this through the real,
+    # file-backed PolicyStore via create_app(), not just this fake
+    # resolver, so an arbitrary/removed tenant_id would 403 there even
+    # though this resolver itself is fully faked.
+    grant = IamPrincipalGrant(tenant_id="tenant1-finance", application_id="team-a-ai-client", roles=["developer"])
     return _FakeIamTenantResolver({_KNOWN_ARN: grant})
 
 
@@ -49,7 +54,7 @@ class AuthenticateIamUnitTests(unittest.TestCase):
         )
 
         self.assertEqual(identity.sub, _KNOWN_ARN)
-        self.assertEqual(identity.tenant_id, "team-a")
+        self.assertEqual(identity.tenant_id, "tenant1-finance")
         self.assertEqual(identity.application_id, "team-a-ai-client")
         self.assertEqual(identity.roles, ["developer"])
         self.assertEqual(identity.auth_type, "aws_iam")
@@ -74,7 +79,7 @@ class AuthenticateIamUnitTests(unittest.TestCase):
         )
 
         self.assertEqual(identity.auth_type, "aws_iam")
-        self.assertEqual(identity.tenant_id, "team-a")
+        self.assertEqual(identity.tenant_id, "tenant1-finance")
 
     def test_authenticate_falls_back_to_jwt_when_no_principal_arn(self):
         fixture = get_auth_fixture()

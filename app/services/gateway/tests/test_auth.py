@@ -118,7 +118,7 @@ class AuthTests(unittest.TestCase):
         fake = FakeConverseClient()
         client = _client()
         fixture = get_auth_fixture()
-        token = fixture.token(tenant_id="finance")
+        token = fixture.token(tenant_id="tenant1-finance")
 
         resp = client.post(
             "/v1/chat",
@@ -126,7 +126,7 @@ class AuthTests(unittest.TestCase):
             headers={**auth_header(token), "X-Tenant-ID": "some-other-tenant"},
         )
 
-        # Request succeeds using the token's tenant (finance), not the
+        # Request succeeds using the token's tenant (tenant1-finance), not the
         # spoofed header -- there's currently no per-tenant behavior
         # difference to assert on directly (that lands in M2), so this
         # test's job is just to prove the header has zero effect on the

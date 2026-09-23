@@ -29,95 +29,39 @@
 # a new caller can use this path.
 
 iam_principals:
-  "arn:aws:iam::646821141010:role/team-a-ai-client":
-    tenant_id: team-a
-    application_id: team-a-ai-client
-    roles: [developer, operator]
-
-  "arn:aws:sts::646821141010:assumed-role/team-a-ai-client/*":
-    tenant_id: team-a
-    application_id: team-a-ai-client
-    roles: [developer, operator]
-
-  # Manual curl/smoke testing via the IAM user's own long-term
-  # credentials (dev only -- do not add a real IAM user here in prod).
-  "arn:aws:iam::646821141010:user/taixingbi":
-    tenant_id: team-a
-    application_id: manual-smoke-test
-    roles: [developer, operator]
-
-  # Manual curl/smoke testing against the finance tenant specifically
-  # (dev only) -- finance has a real monthly_budget (tenants.yaml),
-  # unlike team-a's deliberately-tiny smoke-test budget above, so this
-  # is the entry to use to see an actual model response rather than an
+  # Manual curl/smoke testing against the tenant1-finance tenant
+  # (dev only) -- has a real monthly_budget (tenants.yaml), so this is
+  # the entry to use to see an actual model response rather than an
   # immediate BUDGET_EXCEEDED. Assumed via `aws sts assume-role` from
   # the taixingbi user (see the role's trust policy).
+  #
+  # Renamed 2026-09-23: tenant_id finance -> tenant1-finance (rest of
+  # this file's team-a/tenant-a/tenant-b entries removed entirely in
+  # the same change -- see git log for the prior mappings, including
+  # the taixingbi user's own former team-a mapping, deliberately not
+  # replaced).
   "arn:aws:iam::646821141010:role/finance-manual-smoke-test":
-    tenant_id: finance
+    tenant_id: tenant1-finance
     application_id: finance-manual-smoke-test
     roles: [developer, operator]
 
   "arn:aws:sts::646821141010:assumed-role/finance-manual-smoke-test/*":
-    tenant_id: finance
+    tenant_id: tenant1-finance
     application_id: finance-manual-smoke-test
     roles: [developer, operator]
 
   # Manual curl/smoke testing of plan section 30's ABAC retrofit --
-  # tenant_id: finance + roles: [manager] should be able to see/change
-  # finance's own admin data (GET /v1/admin/usage, /v1/admin/tenants,
-  # PUT /v1/admin/tenants/finance/state) but get 403 acting on any
-  # other tenant, unlike finance-manual-smoke-test above (developer
-  # only, can't reach /v1/admin/* at all).
+  # tenant_id: tenant1-finance + roles: [manager] should be able to
+  # see/change this tenant's own admin data (GET /v1/admin/usage,
+  # /v1/admin/tenants, PUT /v1/admin/tenants/tenant1-finance/state) but
+  # get 403 acting on any other tenant, unlike finance-manual-smoke-test
+  # above (developer only, can't reach /v1/admin/* at all).
   "arn:aws:iam::646821141010:role/finance-manager-smoke-test":
-    tenant_id: finance
+    tenant_id: tenant1-finance
     application_id: finance-manager-smoke-test
     roles: [manager]
 
   "arn:aws:sts::646821141010:assumed-role/finance-manager-smoke-test/*":
-    tenant_id: finance
+    tenant_id: tenant1-finance
     application_id: finance-manager-smoke-test
     roles: [manager]
-
-  # Plan section 29's dedicated-tenant-account model -- tenant-a/tenant-b
-  # each have their own AWS account (998116076808 / 199013204390),
-  # deliberately kept as separate tenant_ids from team-a (not merged) --
-  # team-a stays the shared-account demo tenant (this account, tiny
-  # smoke-test budget), tenant-a/tenant-b are the dedicated-account
-  # isolation demo, showing both tenancy models side by side.
-  #
-  # Tested live 2026-09-17: a tenant account calling this API directly
-  # with its own SigV4 credentials (team-a-ai-client in 998116076808)
-  # 403s -- this platform's HTTP API v2 + AWS_IAM authorizer does not
-  # support cross-account invocation via a caller-side identity policy
-  # alone, and HTTP API v2 has no resource-policy mechanism to grant
-  # that trust either (unlike REST API v1). See plan.md section 29 for
-  # the two alternatives not taken.
-  #
-  # Fix: an assume-role hop. The tenant's own workload role
-  # (team-a-ai-client / team-b-ai-client, in its own account) assumes
-  # ANOTHER role that lives in THIS account -- tenant-a-platform-caller /
-  # tenant-b-platform-caller, trusting only that specific tenant-account
-  # role -- and calls the gateway with those (same-account) credentials
-  # instead. The gateway only ever sees the platform-side assumed-role
-  # ARN below, never the tenant account's own role directly, which is
-  # why the mapping keys off tenant-a-platform-caller, not
-  # tenant-a's team-a-ai-client.
-  "arn:aws:iam::646821141010:role/tenant-a-platform-caller":
-    tenant_id: tenant-a
-    application_id: team-a-ai-client
-    roles: [developer, operator]
-
-  "arn:aws:sts::646821141010:assumed-role/tenant-a-platform-caller/*":
-    tenant_id: tenant-a
-    application_id: team-a-ai-client
-    roles: [developer, operator]
-
-  "arn:aws:iam::646821141010:role/tenant-b-platform-caller":
-    tenant_id: tenant-b
-    application_id: team-b-ai-client
-    roles: [developer, operator]
-
-  "arn:aws:sts::646821141010:assumed-role/tenant-b-platform-caller/*":
-    tenant_id: tenant-b
-    application_id: team-b-ai-client
-    roles: [developer, operator]

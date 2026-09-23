@@ -49,7 +49,7 @@ class JobsEndpointTests(unittest.TestCase):
         self.assertEqual(job_queue.sent, [body["job_id"]])
 
         stored = job_store.get(body["job_id"])
-        self.assertEqual(stored.tenant_id, "finance")
+        self.assertEqual(stored.tenant_id, "tenant1-finance")
         self.assertEqual(stored.application_id, "risk-chat")
 
     def test_get_returns_submitted_job_status(self):
@@ -81,13 +81,14 @@ class JobsEndpointTests(unittest.TestCase):
         submit = client.post(
             "/v1/jobs",
             json={"messages": [{"role": "user", "content": "hi"}]},
-            headers=_auth_headers(tenant_id="finance"),
+            headers=_auth_headers(tenant_id="tenant1-finance"),
         )
         job_id = submit.json()["job_id"]
 
-        # sandbox has an empty model allowlist -- unrelated to this check,
-        # just a second real tenant in policies/tenants.yaml to submit as.
-        resp = client.get(f"/v1/jobs/{job_id}", headers=_auth_headers(tenant_id="sandbox"))
+        # tenant0-sandbox has an empty model allowlist -- unrelated to this
+        # check, just a second real tenant in policies/tenants.yaml to
+        # submit as.
+        resp = client.get(f"/v1/jobs/{job_id}", headers=_auth_headers(tenant_id="tenant0-sandbox"))
 
         self.assertEqual(resp.status_code, 404)
 
@@ -137,7 +138,7 @@ class JobsSessionIdPropagationTests(unittest.TestCase):
         settings = load_settings()
         fixture = get_auth_fixture()
         resolver = _FakeIamResolverWithResourceAuthz(
-            IamPrincipalGrant(tenant_id="team-a", application_id="team-a-ai-client", roles=["developer"])
+            IamPrincipalGrant(tenant_id="tenant1-finance", application_id="team-a-ai-client", roles=["developer"])
         )
         app = create_app(
             settings=settings,

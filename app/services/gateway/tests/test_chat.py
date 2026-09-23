@@ -62,7 +62,7 @@ class ChatEndpointTests(unittest.TestCase):
                 "model": "anthropic.claude-3-haiku",
                 "messages": [{"role": "user", "content": "hi"}],
             },
-            headers=_auth_headers(tenant_id="sandbox"),
+            headers=_auth_headers(tenant_id="tenant0-sandbox"),
         )
 
         self.assertEqual(fake.calls[0]["model_id"], "anthropic.claude-3-haiku")
@@ -77,7 +77,7 @@ class ChatEndpointTests(unittest.TestCase):
         client.post(
             "/v1/chat",
             json={"messages": [{"role": "user", "content": "hi"}]},
-            headers=_auth_headers(tenant_id="sandbox"),
+            headers=_auth_headers(tenant_id="tenant0-sandbox"),
         )
 
         self.assertEqual(fake.calls[0]["model_id"], settings.bedrock_model_id)

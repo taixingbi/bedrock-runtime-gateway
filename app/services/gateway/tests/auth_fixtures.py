@@ -27,7 +27,7 @@ class AuthFixture:
         self,
         *,
         sub: str = "user-1",
-        tenant_id: str = "finance",
+        tenant_id: str = "tenant1-finance",
         application_id: str = "risk-chat",
         roles: Optional[List[str]] = None,
         ttl_s: float = 3600.0,

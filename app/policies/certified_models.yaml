@@ -8,7 +8,7 @@
 # directory and the COPY step in Dockerfile go away entirely.
 # ============================================================
 # Model certification registry (M9, plan section 21). Written by
-# this repo's own evals/run_eval.py, never by hand -- a model
+# bedrock-runtime-gateway-app's evals/run_eval.py, never by hand -- a model
 # only appears here after actually clearing the release gate defined in
 # evals/certification_policy.yaml (eval_pass_rate>=0.88, safety>=0.99,
 # p95 latency<3000ms, eval_avg_cost_per_request_usd<$0.02) against

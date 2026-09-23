@@ -18,12 +18,12 @@ from __future__ import annotations
 from typing import Any, Callable, Dict
 
 from ..gateway.config import load_settings
-from ..gateway.guardrails.basic_guardrail import BasicGuardrailClient
 from ..gateway.inference.bedrock_client import BedrockClient
 from ..gateway.jobs.processor import process_one
 from ..gateway.jobs.store import DynamoDbJobStore
 from ..gateway.policy.cache import PolicySnapshotCache
-from ..gateway.policy.store import FilePolicyStore
+from ..gateway.dependencies import build_policy_store, build_guardrail_client, build_concurrency_limiter
+from ..gateway.jobs.heartbeat import heartbeat
 from ..gateway.routing.certification import certified_model_ids, load_certified_models_from_yaml
 from ..gateway.routing.circuit_breaker import CircuitBreaker
 from ..gateway.routing.router import CertifiedRouter, load_route_sets_from_yaml
@@ -47,7 +47,10 @@ def run_forever(
         )
         for message in response.get("Messages", []):
             try:
-                process(message["Body"], **process_kwargs)
+                with heartbeat(lambda: sqs_client.change_message_visibility(
+                    QueueUrl=queue_url, ReceiptHandle=message["ReceiptHandle"], VisibilityTimeout=120,
+                )):
+                    process(message["Body"], **process_kwargs)
             except Exception as exc:  # noqa: BLE001 - leave message for redelivery, keep polling
                 log_event(
                     _logger, "ERROR", "job processing raised, leaving message for redelivery",
@@ -73,9 +76,9 @@ def main() -> None:
 
     job_store = DynamoDbJobStore(table_name=settings.jobs_table_name, region=settings.aws_region)
     policy_cache = PolicySnapshotCache(
-        store=FilePolicyStore(settings.tenant_policy_path), ttl_s=settings.policy_cache_ttl_s
+        store=build_policy_store(settings), ttl_s=settings.policy_cache_ttl_s
     )
-    guardrail_client = BasicGuardrailClient()
+    guardrail_client = build_guardrail_client(settings)
     converse_client = BedrockClient(
         region=settings.aws_region,
         timeout_s=settings.bedrock_timeout_s,
@@ -109,6 +112,7 @@ def main() -> None:
         guardrail_client=guardrail_client,
         router=router,
         usage_store=usage_store,
+        concurrency_limiter=build_concurrency_limiter(settings),
     )
 
 

@@ -21,6 +21,9 @@ streaming request either.
 """
 from __future__ import annotations
 
+import asyncio
+from .pipeline import PipelineError
+
 import json
 import time
 from typing import AsyncIterator, Awaitable, Callable, Iterator, Optional
@@ -40,15 +43,36 @@ async def stream_chat_response(
     tenant_id: str,
     circuit_breaker: CircuitBreaker,
     is_disconnected: Callable[[], Awaitable[bool]],
+    on_complete=None,
 ) -> AsyncIterator[bytes]:
     generated_chunks = 0
     aborted = False
     final: Optional[StreamChunk] = None
     start = time.perf_counter()
 
+    status = 200
+    sentinel = object()
+    pending = None
+
+    def next_chunk():
+        return next(chunks, sentinel)
+
     try:
-        for chunk in chunks:
+        while True:
+            pending = asyncio.create_task(asyncio.to_thread(next_chunk))
+            try:
+                chunk = await asyncio.shield(pending)
+            except asyncio.CancelledError:
+                # Cleanup below owns the still-running read, even if the HTTP
+                # task receives another cancellation while shutting down.
+                status = 499
+                raise
+            if chunk is sentinel:
+                break
+            if chunk.is_final:
+                final = chunk
             if await is_disconnected():
+                status = 499
                 aborted = True
                 break
             if chunk.text_delta:
@@ -56,19 +80,39 @@ async def stream_chat_response(
                 yield _sse(data={"delta": chunk.text_delta})
             if chunk.is_final:
                 final = chunk
-    except BedrockInvocationError as exc:
-        circuit_breaker.record_failure(model_id)
-        yield _sse(data={"error": {"code": "UPSTREAM_ERROR", "message": str(exc), "request_id": request_id}})
+    except (BedrockInvocationError, PipelineError) as exc:
+        status = getattr(exc, "status_code", 502)
+        if isinstance(exc, BedrockInvocationError):
+            circuit_breaker.record_failure(model_id)
+        yield _sse(data={"error": {"code": exc.code if isinstance(exc, PipelineError) else "UPSTREAM_ERROR", "message": str(exc), "request_id": request_id}})
         yield _sse(event="done", data={})
         log_event(
             _logger, "ERROR", "chat stream failed",
             request_id=request_id, model=model_id, tenant_id=tenant_id, error=str(exc),
         )
         return
+    except BaseException as exc:
+        status = 499 if isinstance(exc, (asyncio.CancelledError, GeneratorExit)) else 500
+        raise
     finally:
-        close = getattr(chunks, "close", None)
-        if callable(close):
-            close()
+        async def cleanup():
+            nonlocal final
+            if pending is not None:
+                try:
+                    last = await pending
+                    if last is not sentinel and last.is_final:
+                        final = last
+                except Exception:
+                    pass  # The stream error was already handled above.
+            try:
+                close = getattr(chunks, "close", None)
+                if callable(close):
+                    await asyncio.to_thread(close)
+            finally:
+                if on_complete is not None:
+                    await asyncio.to_thread(on_complete, final, status)
+        cleanup_task = asyncio.create_task(cleanup())
+        await asyncio.shield(cleanup_task)
 
     if not aborted:
         circuit_breaker.record_success(model_id)
@@ -90,7 +134,7 @@ async def stream_chat_response(
         _logger, "INFO", "chat stream completed",
         request_id=request_id, model=model_id, tenant_id=tenant_id,
         client_disconnected=aborted, generated_chunks=generated_chunks,
-        stream_duration_ms=duration_ms, status=200,
+        stream_duration_ms=duration_ms, status=status,
     )
 
 

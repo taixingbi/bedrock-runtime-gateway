@@ -53,11 +53,17 @@ class UsageStore(Protocol):
         with spend=0."""
         ...
 
+    def record(self, tenant_id: str, application_id: str, amount: float,
+               invocation_id: str, month: str, day: str) -> None:
+        """Atomically record all spend dimensions once per provider invocation."""
+        ...
+
 
 class InMemoryUsageStore:
     def __init__(self) -> None:
         self._totals: Dict[Tuple[str, str], float] = {}
         self._lock = threading.Lock()
+        self._recorded = set()
 
     def add_and_get(self, tenant_id: str, month: str, amount: float) -> float:
         with self._lock:
@@ -70,6 +76,15 @@ class InMemoryUsageStore:
         with self._lock:
             return self._totals.get((tenant_id, month), 0.0)
 
+    def record(self, tenant_id, application_id, amount, invocation_id, month, day):
+        with self._lock:
+            marker = (tenant_id, invocation_id)
+            if marker in self._recorded:
+                return
+            for key in ((tenant_id, month), (tenant_id, day), (_application_key(tenant_id, application_id), month)):
+                self._totals[key] = self._totals.get(key, 0.0) + amount
+            self._recorded.add(marker)
+
 
 class DynamoDbUsageStore:
     """Real DynamoDB-backed UsageStore. boto3 imported lazily, same
@@ -79,6 +94,7 @@ class DynamoDbUsageStore:
         import boto3
 
         self._table = boto3.resource("dynamodb", region_name=region).Table(table_name)
+        self._client = boto3.client("dynamodb", region_name=region)
 
     def add_and_get(self, tenant_id: str, month: str, amount: float) -> float:
         from decimal import Decimal
@@ -98,6 +114,27 @@ class DynamoDbUsageStore:
             return 0.0
         return float(item["spend"])
 
+    def record(self, tenant_id, application_id, amount, invocation_id, month, day):
+        from botocore.exceptions import ClientError
+        marker = {"tenant_id": {"S": tenant_id}, "month": {"S": "invocation#" + invocation_id}}
+        items = [{"Put": {"TableName": self._table.name, "Item": marker,
+                          "ConditionExpression": "attribute_not_exists(tenant_id)"}}]
+        for tenant, period in ((tenant_id, month), (tenant_id, day), (_application_key(tenant_id, application_id), month)):
+            items.append({"Update": {
+                "TableName": self._table.name,
+                "Key": {"tenant_id": {"S": tenant}, "month": {"S": period}},
+                "UpdateExpression": "ADD spend :amount",
+                "ExpressionAttributeValues": {":amount": {"N": str(amount)}},
+            }})
+        try:
+            self._client.transact_write_items(TransactItems=items)
+        except ClientError as exc:
+            reasons = exc.response.get("CancellationReasons", [])
+            if (exc.response["Error"]["Code"] == "TransactionCanceledException" and reasons
+                    and reasons[0].get("Code") == "ConditionalCheckFailed"):
+                return  # This invocation was already accounted for atomically.
+            raise
+
 
 def _application_key(tenant_id: str, application_id: str) -> str:
     return f"{tenant_id}#app:{application_id}"
@@ -116,3 +153,12 @@ def add_and_get_application(
 
 def get_application(store: "UsageStore", tenant_id: str, application_id: str, month: str) -> float:
     return store.get(_application_key(tenant_id, application_id), month)
+
+
+def record_provider_usage(store, tenant_id, application_id, amount, *, invocation_id):
+    """Record the three spend dimensions once per server-generated invocation.
+
+    Markers deliberately do not expire: replay must not charge twice. They
+    record provider estimates, not internal charges for cached responses.
+    """
+    store.record(tenant_id, application_id, amount, invocation_id, current_month(), current_day())

@@ -42,7 +42,8 @@ class DynamoDbConcurrencyLimiterTests(unittest.TestCase):
 
     def test_acquire_rejected_when_tenant_cap_exhausted(self):
         for _ in range(3):
-            self.assertTrue(self.limiter.try_acquire("acme", tenant_max=3))
+            token = self.limiter.try_acquire("acme", tenant_max=3)
+            self.assertTrue(token)
 
         self.assertFalse(self.limiter.try_acquire("acme", tenant_max=3))
         # Global counter must NOT have incremented on the rejected
@@ -63,39 +64,41 @@ class DynamoDbConcurrencyLimiterTests(unittest.TestCase):
 
     def test_two_tenants_are_isolated(self):
         for _ in range(3):
-            self.assertTrue(self.limiter.try_acquire("acme", tenant_max=3))
+            token = self.limiter.try_acquire("acme", tenant_max=3)
+            self.assertTrue(token)
 
         # acme is now exhausted, but a different tenant is unaffected.
         self.assertTrue(self.limiter.try_acquire("other-tenant", tenant_max=3))
 
     def test_release_frees_a_slot(self):
-        self.limiter.try_acquire("acme")
+        token = self.limiter.try_acquire("acme")
         self.limiter.try_acquire("acme")
         self.assertEqual(self.limiter.current_global_count(), 2)
 
-        self.limiter.release("acme")
+        self.limiter.release("acme", token)
 
         self.assertEqual(self.limiter.current_global_count(), 1)
 
     def test_release_after_acquiring_up_to_cap_allows_a_new_acquire(self):
         for _ in range(3):
-            self.assertTrue(self.limiter.try_acquire("acme", tenant_max=3))
+            token = self.limiter.try_acquire("acme", tenant_max=3)
+            self.assertTrue(token)
         self.assertFalse(self.limiter.try_acquire("acme", tenant_max=3))
 
-        self.limiter.release("acme")
+        self.limiter.release("acme", token)
 
         self.assertTrue(self.limiter.try_acquire("acme", tenant_max=3))
 
     def test_double_release_does_not_go_negative_or_raise(self):
-        self.limiter.try_acquire("acme")
-        self.limiter.release("acme")
+        token = self.limiter.try_acquire("acme")
+        self.limiter.release("acme", token)
 
-        self.limiter.release("acme")  # no raise
+        self.limiter.release("acme", token)  # no raise
 
         self.assertEqual(self.limiter.current_global_count(), 0)
 
     def test_release_on_never_acquired_tenant_does_not_raise(self):
-        self.limiter.release("never-acquired-tenant")  # no raise
+        self.limiter.release("never-acquired-tenant", "unknown")  # no raise
 
     def test_current_global_count_is_zero_before_any_acquire(self):
         self.assertEqual(self.limiter.current_global_count(), 0)
@@ -173,14 +176,11 @@ class DynamoDbConcurrencyLimiterLeaseTests(unittest.TestCase):
         ).get("Item")
         self.assertIsNone(item)
 
-    def test_release_without_lease_token_still_frees_the_counter(self):
-        """Backward-compatible fallback -- release(tenant_id) alone
-        (no token) still decrements, matching the pre-lease behavior,
-        just without deleting a specific lease item."""
+    def test_release_without_token_is_rejected_without_decrement(self):
         self.limiter.try_acquire("acme")
-        self.limiter.release("acme")
-
-        self.assertEqual(self.limiter.current_global_count(), 0)
+        with self.assertRaises(ValueError):
+            self.limiter.release("acme")
+        self.assertEqual(self.limiter.current_global_count(), 1)
 
     def test_reconcile_sweeps_an_expired_lease_and_frees_its_slot(self):
         limiter = DynamoDbConcurrencyLimiter(

@@ -16,6 +16,11 @@ queued job.
 """
 from __future__ import annotations
 
+from ..concurrency import maintained_lease
+from .heartbeat import heartbeat
+from .models import JobBusyError
+from ..usage.store import record_provider_usage
+
 import dataclasses
 import json
 
@@ -27,7 +32,7 @@ from ..policy.models import BLOCKING_STATES
 from ..routing.router import AllRoutesUnavailableError, CertifiedRouter
 from ..telemetry.cost import estimate_cost
 from ..telemetry.logging import get_logger, log_event
-from ..usage.store import UsageStore, current_month
+from ..usage.store import UsageStore
 from .models import JobNotFoundError, JobStatus
 from .store import JobStore
 
@@ -42,30 +47,41 @@ def process_one(
     guardrail_client: GuardrailClient,
     router: CertifiedRouter,
     usage_store: UsageStore,
+    concurrency_limiter,
 ) -> None:
     job_id = json.loads(message_body)["job_id"]
 
     try:
-        job = job_store.get(job_id)
+        job = job_store.claim(job_id)
     except JobNotFoundError:
         log_event(_logger, "ERROR", "job record missing for queued message", job_id=job_id)
         return
 
-    if job.status != JobStatus.QUEUED:
+    if job.status in (JobStatus.SUCCEEDED, JobStatus.FAILED):
         # SQS is at-least-once -- a redelivered message for an already
         # SUCCEEDED/FAILED job must not re-run it.
         return
 
     policy = policy_cache.get(job.tenant_id)
     if policy.state in BLOCKING_STATES:
-        job_store.put(dataclasses.replace(
+        job_store.finish(dataclasses.replace(
             job, status=JobStatus.FAILED, error_code="TENANT_BLOCKED",
             error_message=f"tenant '{job.tenant_id}' is {policy.state.value}",
         ))
         return
 
-    job_store.put(dataclasses.replace(job, status=JobStatus.RUNNING))
 
+    limiter = concurrency_limiter
+    token = limiter.try_acquire(job.tenant_id, tenant_max=policy.max_concurrency)
+    if not token:
+        job_store.finish(dataclasses.replace(job, status=JobStatus.QUEUED))
+        raise JobBusyError("inference capacity exhausted")
+    with maintained_lease(limiter, job.tenant_id, token):
+        with heartbeat(lambda: job_store.renew(job)):
+            _execute(job, policy, job_store, guardrail_client, router, usage_store)
+
+
+def _execute(job, policy, job_store, guardrail_client, router, usage_store):
     messages = [BedrockChatMessage(role=m.role, text=m.content) for m in job.messages]
     try:
         routed = router.converse(
@@ -76,37 +92,38 @@ def process_one(
             temperature=job.temperature,
         )
     except BedrockInvocationError as exc:
-        job_store.put(dataclasses.replace(
+        job_store.finish(dataclasses.replace(
             job, status=JobStatus.FAILED, error_code=exc.code, error_message=str(exc),
         ))
         return
     except AllRoutesUnavailableError as exc:
-        job_store.put(dataclasses.replace(
+        job_store.finish(dataclasses.replace(
             job, status=JobStatus.FAILED, error_code="ALL_ROUTES_UNAVAILABLE", error_message=str(exc),
         ))
         return
 
     result = routed.result
+    estimated_cost = estimate_cost(
+        routed.model_id, input_tokens=result.input_tokens, output_tokens=result.output_tokens
+    )
+    record_provider_usage(usage_store, job.tenant_id, job.application_id, estimated_cost,
+                          invocation_id=job.execution_id)
     try:
         pipeline.check_output_guardrail(result.text, policy=policy, guardrail_client=guardrail_client)
     except pipeline.PipelineError as exc:
-        job_store.put(dataclasses.replace(
+        job_store.finish(dataclasses.replace(
             job, status=JobStatus.FAILED, error_code=exc.code, error_message=str(exc),
         ))
         return
 
-    job_store.put(dataclasses.replace(
+    job_store.finish(dataclasses.replace(
         job,
         status=JobStatus.SUCCEEDED,
         output=result.text,
         usage_input_tokens=result.input_tokens,
         usage_output_tokens=result.output_tokens,
     ))
-    estimated_cost = estimate_cost(
-        routed.model_id, input_tokens=result.input_tokens, output_tokens=result.output_tokens
-    )
-    usage_store.add_and_get(job.tenant_id, current_month(), estimated_cost)
     log_event(
         _logger, "INFO", "job completed",
-        job_id=job_id, tenant_id=job.tenant_id, model=routed.model_id, status=JobStatus.SUCCEEDED.value,
+        job_id=job.job_id, tenant_id=job.tenant_id, model=routed.model_id, status=JobStatus.SUCCEEDED.value,
     )

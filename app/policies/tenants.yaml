@@ -42,6 +42,7 @@ tenants:
       p95_latency_ms: 3000
     policy_epoch: 1
     monthly_budget: 10000 # M8 FinOps hard limit, USD/month
+    queue_enabled: true # 2026-09-23: wait up to queue_max_wait_s (default 5s) for a freed concurrency slot instead of an immediate 429
 
   # Renamed 2026-09-23 from "search" (settings unchanged).
   tenant2-search:

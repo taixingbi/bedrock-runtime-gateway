@@ -24,7 +24,7 @@ to actually write.
 Usage:
     python -m scripts.migrate_file_tenants_to_dynamodb \\
         --tenants-path policies/tenants.yaml \\
-        --table-name gateway-dev-provisioned-tenant-policies \\
+        --table-name gateway-tenant-policies-dev \\
         --region us-east-1
         [--apply]
 """

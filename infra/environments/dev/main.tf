@@ -335,7 +335,12 @@ resource "aws_sqs_queue" "jobs" {
 }
 
 resource "aws_dynamodb_table" "jobs" {
-  name         = "${local.name_prefix}-jobs"
+  # Renamed 2026-09-23 from gateway-dev-jobs to the <name>-<env> convention
+  # -- see aws_dynamodb_table.provisioned_principal_mappings's comment for
+  # why (ForceNew name, so this was create-new/copy-items/cut-over/
+  # decommission-old, not a destroy+recreate); state re-pointed via
+  # `state rm` + `import`.
+  name         = "gateway-jobs-dev"
   billing_mode = "PAY_PER_REQUEST"
   hash_key     = "job_id"
 
@@ -563,7 +568,9 @@ resource "aws_bedrock_guardrail_version" "v1" {
 # One row per (tenant_id, month) -- a new month is just a new row, no
 # reset job needed. month is "YYYY-MM" UTC (see usage/store.py).
 resource "aws_dynamodb_table" "usage" {
-  name         = "${local.name_prefix}-usage"
+  # Renamed 2026-09-23 from gateway-dev-usage -- see
+  # aws_dynamodb_table.provisioned_principal_mappings's comment.
+  name         = "gateway-usage-dev"
   billing_mode = "PAY_PER_REQUEST"
   hash_key     = "tenant_id"
   range_key    = "month"
@@ -600,7 +607,13 @@ resource "aws_dynamodb_table" "usage" {
 # counts, rate-limit token buckets), never data worth restoring; a
 # point-in-time restore would just reintroduce stale counter values.
 resource "aws_dynamodb_table" "admission_control" {
-  name         = "${local.name_prefix}-admission-control"
+  # Renamed 2026-09-23 from gateway-dev-admission-control -- see
+  # aws_dynamodb_table.provisioned_principal_mappings's comment for the
+  # rename procedure; unlike that table's data, this one's counters were
+  # deliberately left to start fresh on the new table (see this block's
+  # own comment above on why PITR/restoring old counter values here was
+  # never meaningful anyway).
+  name         = "gateway-admission-control-dev"
   billing_mode = "PAY_PER_REQUEST"
   hash_key     = "pk"
 
@@ -632,7 +645,9 @@ resource "aws_dynamodb_table" "admission_control" {
 # --- M11: Application Onboarding (plan section 22) -------------------------
 
 resource "aws_dynamodb_table" "onboarding_requests" {
-  name         = "${local.name_prefix}-onboarding-requests"
+  # Renamed 2026-09-23 from gateway-dev-onboarding-requests -- see
+  # aws_dynamodb_table.provisioned_principal_mappings's comment.
+  name         = "gateway-onboarding-requests-dev"
   billing_mode = "PAY_PER_REQUEST"
   hash_key     = "request_id"
 
@@ -654,7 +669,9 @@ resource "aws_dynamodb_table" "onboarding_requests" {
 # always read as one ordered sequence, never looked up by event alone
 # (see onboarding/audit.py).
 resource "aws_dynamodb_table" "onboarding_audit" {
-  name         = "${local.name_prefix}-onboarding-audit"
+  # Renamed 2026-09-23 from gateway-dev-onboarding-audit -- see
+  # aws_dynamodb_table.provisioned_principal_mappings's comment.
+  name         = "gateway-onboarding-audit-dev"
   billing_mode = "PAY_PER_REQUEST"
   hash_key     = "request_id"
   range_key    = "timestamp"
@@ -681,7 +698,10 @@ resource "aws_dynamodb_table" "onboarding_audit" {
 # provisioned through onboarding lives here; an existing hand-managed
 # tenant never does (see policy/store.py's LayeredPolicyStore).
 resource "aws_dynamodb_table" "provisioned_tenant_policies" {
-  name         = "${local.name_prefix}-provisioned-tenant-policies"
+  # Renamed 2026-09-23 from gateway-dev-provisioned-tenant-policies to
+  # gateway-tenant-policies-dev -- see
+  # aws_dynamodb_table.provisioned_principal_mappings's comment.
+  name         = "gateway-tenant-policies-dev"
   billing_mode = "PAY_PER_REQUEST"
   hash_key     = "tenant_id"
 
@@ -734,7 +754,9 @@ resource "aws_dynamodb_table" "provisioned_principal_mappings" {
 # One row per proposed edit to an already-provisioned tenant's policy --
 # see services/gateway/policy/change_requests.py's PolicyChangeRequest.
 resource "aws_dynamodb_table" "policy_change_requests" {
-  name         = "${local.name_prefix}-policy-change-requests"
+  # Renamed 2026-09-23 from gateway-dev-policy-change-requests -- see
+  # aws_dynamodb_table.provisioned_principal_mappings's comment.
+  name         = "gateway-policy-change-requests-dev"
   billing_mode = "PAY_PER_REQUEST"
   hash_key     = "change_id"
 
@@ -757,7 +779,10 @@ resource "aws_dynamodb_table" "policy_change_requests" {
 # archive before overwriting, and what rollback() reads back from (see
 # services/gateway/policy/store.py's DynamoDbPolicyStore._archive()).
 resource "aws_dynamodb_table" "provisioned_tenant_policies_history" {
-  name         = "${local.name_prefix}-provisioned-tenant-policies-history"
+  # Renamed 2026-09-23 from gateway-dev-provisioned-tenant-policies-history
+  # to gateway-tenant-policies-history-dev -- see
+  # aws_dynamodb_table.provisioned_principal_mappings's comment.
+  name         = "gateway-tenant-policies-history-dev"
   billing_mode = "PAY_PER_REQUEST"
   hash_key     = "tenant_id"
   range_key    = "policy_epoch"

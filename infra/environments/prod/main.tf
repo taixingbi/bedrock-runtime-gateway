@@ -145,7 +145,12 @@ resource "aws_sqs_queue" "jobs" {
 }
 
 resource "aws_dynamodb_table" "jobs" {
-  name         = "${local.name_prefix}-jobs"
+  # Renamed 2026-09-23 to match dev's gateway-jobs-dev -- see
+  # environments/dev/main.tf's own comment on this table for the
+  # migration procedure dev went through; prod is config-mirrored, never
+  # terraform-applied (no live prod table exists yet), so this is a
+  # plain source edit, not a live cutover.
+  name         = "gateway-jobs-prod"
   billing_mode = "PAY_PER_REQUEST"
   hash_key     = "job_id"
 
@@ -351,7 +356,9 @@ resource "aws_bedrock_guardrail_version" "v1" {
 # --- M8: FinOps -----------------------------------------------------------
 
 resource "aws_dynamodb_table" "usage" {
-  name         = "${local.name_prefix}-usage"
+  # Renamed 2026-09-23 to match dev's gateway-usage-dev -- see
+  # environments/dev/main.tf's own comment on this table.
+  name         = "gateway-usage-prod"
   billing_mode = "PAY_PER_REQUEST"
   hash_key     = "tenant_id"
   range_key    = "month"
@@ -378,7 +385,9 @@ resource "aws_dynamodb_table" "usage" {
 # environments/dev/main.tf's own copy of this resource for the full
 # design note.
 resource "aws_dynamodb_table" "admission_control" {
-  name         = "${local.name_prefix}-admission-control"
+  # Renamed 2026-09-23 to match dev's gateway-admission-control-dev --
+  # see environments/dev/main.tf's own comment on this table.
+  name         = "gateway-admission-control-prod"
   billing_mode = "PAY_PER_REQUEST"
   hash_key     = "pk"
 
@@ -402,7 +411,9 @@ resource "aws_dynamodb_table" "admission_control" {
 # --- M11: Application Onboarding (plan section 22) -------------------------
 
 resource "aws_dynamodb_table" "onboarding_requests" {
-  name         = "${local.name_prefix}-onboarding-requests"
+  # Renamed 2026-09-23 to match dev's gateway-onboarding-requests-dev --
+  # see environments/dev/main.tf's own comment on this table.
+  name         = "gateway-onboarding-requests-prod"
   billing_mode = "PAY_PER_REQUEST"
   hash_key     = "request_id"
 
@@ -421,7 +432,9 @@ resource "aws_dynamodb_table" "onboarding_requests" {
 }
 
 resource "aws_dynamodb_table" "onboarding_audit" {
-  name         = "${local.name_prefix}-onboarding-audit"
+  # Renamed 2026-09-23 to match dev's gateway-onboarding-audit-dev --
+  # see environments/dev/main.tf's own comment on this table.
+  name         = "gateway-onboarding-audit-prod"
   billing_mode = "PAY_PER_REQUEST"
   hash_key     = "request_id"
   range_key    = "timestamp"
@@ -445,7 +458,9 @@ resource "aws_dynamodb_table" "onboarding_audit" {
 }
 
 resource "aws_dynamodb_table" "provisioned_tenant_policies" {
-  name         = "${local.name_prefix}-provisioned-tenant-policies"
+  # Renamed 2026-09-23 to match dev's gateway-tenant-policies-dev -- see
+  # environments/dev/main.tf's own comment on this table.
+  name         = "gateway-tenant-policies-prod"
   billing_mode = "PAY_PER_REQUEST"
   hash_key     = "tenant_id"
 
@@ -485,7 +500,9 @@ resource "aws_dynamodb_table" "provisioned_principal_mappings" {
 # --- Plan section 33: policy versioning/approval/rollback -----------------
 
 resource "aws_dynamodb_table" "policy_change_requests" {
-  name         = "${local.name_prefix}-policy-change-requests"
+  # Renamed 2026-09-23 to match dev's gateway-policy-change-requests-dev
+  # -- see environments/dev/main.tf's own comment on this table.
+  name         = "gateway-policy-change-requests-prod"
   billing_mode = "PAY_PER_REQUEST"
   hash_key     = "change_id"
 
@@ -504,7 +521,10 @@ resource "aws_dynamodb_table" "policy_change_requests" {
 }
 
 resource "aws_dynamodb_table" "provisioned_tenant_policies_history" {
-  name         = "${local.name_prefix}-provisioned-tenant-policies-history"
+  # Renamed 2026-09-23 to match dev's
+  # gateway-tenant-policies-history-dev -- see
+  # environments/dev/main.tf's own comment on this table.
+  name         = "gateway-tenant-policies-history-prod"
   billing_mode = "PAY_PER_REQUEST"
   hash_key     = "tenant_id"
   range_key    = "policy_epoch"

@@ -1,5 +1,6 @@
 import time
 import unittest
+from ..concurrency import ConcurrencyLimiter
 
 from ..guardrails.basic_guardrail import BasicGuardrailClient
 from ..inference.bedrock_client import BedrockInvocationError
@@ -54,6 +55,7 @@ def _process(message_body, *, job_store, policy_cache, guardrail_client, router,
         guardrail_client=guardrail_client,
         router=router,
         usage_store=usage_store if usage_store is not None else InMemoryUsageStore(),
+        concurrency_limiter=ConcurrencyLimiter(global_max=10, default_tenant_max=10),
     )
 
 

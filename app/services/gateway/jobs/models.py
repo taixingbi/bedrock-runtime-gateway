@@ -37,6 +37,8 @@ class Job:
     temperature: float
     created_at: float  # epoch seconds, time.time()
 
+    execution_id: Optional[str] = None
+    lease_expires_at: Optional[float] = None
     output: Optional[str] = None
     error_code: Optional[str] = None
     error_message: Optional[str] = None
@@ -48,3 +50,7 @@ class JobNotFoundError(Exception):
     def __init__(self, job_id: str):
         super().__init__(f"no job '{job_id}'")
         self.job_id = job_id
+
+
+class JobBusyError(Exception):
+    """Another worker owns this job; leave the message available for retry."""

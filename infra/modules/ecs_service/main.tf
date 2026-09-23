@@ -343,7 +343,7 @@ data "aws_iam_policy_document" "jobs_access" {
 
   statement {
     sid       = "UsageRecords"
-    actions   = ["dynamodb:GetItem", "dynamodb:UpdateItem"]
+    actions   = ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:UpdateItem"]
     resources = [var.usage_table_arn]
   }
 

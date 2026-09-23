@@ -128,3 +128,13 @@ variable "dynamodb_table_arn" {
 variable "usage_table_arn" {
   type = string
 }
+
+variable "tenant_policies_table_arn" {
+  type = string
+}
+variable "admission_control_table_arn" {
+  type = string
+}
+variable "guardrail_arn" {
+  type = string
+}

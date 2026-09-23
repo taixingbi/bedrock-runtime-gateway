@@ -22,17 +22,21 @@ A timed-out call is NOT cancelled -- Python threads can't be forcibly
 killed. `timeout_s` bounds how long the *caller* waits, not how long
 the orphaned thread keeps running; the thread pool's own fixed size is
 what actually prevents unbounded resource growth from a pile-up of
-orphaned calls, not the timeout itself. Callers must still release the
-concurrency slot they held even after a timeout (see routes.py's
-`finally`), or a timed-out request would leak a permanently-held slot.
+orphaned calls, not the timeout itself. Capacity is released by the
+blocking operation itself, when it actually finishes, not by the HTTP
+waiter's timeout/cancellation path.
 """
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
+from contextlib import contextmanager
+import logging
+import time
 from typing import Any, Callable, Dict, Optional, TypeVar
 
 T = TypeVar("T")
@@ -94,50 +98,11 @@ class ConcurrencyLimiter:
 
 
 class DynamoDbConcurrencyLimiter:
-    """Distributed counterpart to `ConcurrencyLimiter` (plan section
-    35.2, P0 production hardening). Confirmed live: `ConcurrencyLimiter`
-    above is `threading.Lock` + an in-process `Dict[str, int]` --
-    correct *within one ECS task*, but `TenantPolicy.max_concurrency=8`
-    means 8 per task, not 8 platform-wide, the instant `desired_count`
-    goes above 1 (plan section 35.6 just made that the normal case, not
-    an edge case). Same `try_acquire`/`release`/`current_global_count`
-    shape as `ConcurrencyLimiter` -- a structural (duck-typed) drop-in,
-    not a formal Protocol, to avoid renaming the existing class and
-    touching every call site/test that imports it by name.
+    """Shared global/tenant counters with renewable ownership leases.
 
-    DynamoDB, not Redis/ElastiCache -- avoids a new always-on paid
-    resource (Redis bills whether or not it's used; DynamoDB on-demand
-    doesn't) and reuses infrastructure this platform already operates.
-
-    Implementation: two atomic counters (`global`, `tenant:<id>`) as
-    separate items in one table, incremented/decremented together via
-    `TransactWriteItems` so a `try_acquire` either admits into BOTH
-    counters or neither -- no window where global succeeds but tenant
-    fails (or vice versa). Each `Update`'s own `ConditionExpression`
-    (count below its cap, or the item doesn't exist yet) is what makes
-    the whole transaction atomically reject when either cap is full.
-
-    Plan section 35.18 (P0 production hardening): a TTL'd lease per
-    request, not a bare scalar -- the fix this class's own earlier
-    docstring flagged as a genuine follow-up rather than silently
-    implied as solved. `try_acquire` now writes a third item alongside
-    the two counters in the same TransactWriteItems call: a lease
-    record (`lease#<tenant>#<uuid4>`) carrying `expires_at`, a fixed
-    ceiling (`lease_ttl_s`, generously longer than any legitimate
-    blocking call ever takes -- api/routes.py's `finally:` always
-    releases promptly even on a BlockingCallTimeoutError, so a lease
-    outliving this is a real crash, not a slow call). `release()`
-    deletes that same lease record in the same transaction it
-    decrements the counters in. An ungraceful process death between
-    those two still leaves the lease record (and the counts it
-    represents) orphaned -- but now `reconcile()`, triggered
-    probabilistically from `try_acquire` (see `_RECONCILE_PROBABILITY`,
-    no new scheduled job/Lambda needed), sweeps any lease whose
-    `expires_at` has passed and compensates the counters + deletes it.
-    The DynamoDB table's own native TTL (infra's `ttl` block on this
-    table) is a separate, storage-only backstop -- it does NOT run any
-    of this app's code, so it cannot compensate a counter by itself;
-    `reconcile()` is what actually fixes the leak.
+    Only a transaction deleting an existing lease may decrement counters.
+    Lease expiry is application-managed: native DynamoDB TTL must not delete
+    ownership records before reconciliation can compensate their counters.
     """
 
     _RECONCILE_PROBABILITY = 0.01
@@ -166,9 +131,11 @@ class DynamoDbConcurrencyLimiter:
             self.reconcile()
 
         limit = tenant_max if tenant_max is not None else self._default_tenant_max
+        if limit <= 0 or self._global_max <= 0:
+            return None
         lease_id = str(uuid.uuid4())
         lease_pk = self._lease_pk(tenant_id, lease_id)
-        expires_at = time_module.time() + self._lease_ttl_s
+        lease_expires_at = time_module.time() + self._lease_ttl_s
         try:
             self._client.transact_write_items(
                 TransactItems=[
@@ -180,7 +147,7 @@ class DynamoDbConcurrencyLimiter:
                             "Item": {
                                 "pk": {"S": lease_pk},
                                 "tenant_id": {"S": tenant_id},
-                                "expires_at": {"N": str(expires_at)},
+                                "lease_expires_at": {"N": str(lease_expires_at)},
                             },
                             "ConditionExpression": "attribute_not_exists(pk)",
                         }
@@ -196,6 +163,8 @@ class DynamoDbConcurrencyLimiter:
     def release(self, tenant_id: str, lease_token: Optional[str] = None) -> None:
         from botocore.exceptions import ClientError
 
+        if not lease_token:
+            raise ValueError("a lease token is required to release distributed capacity")
         items = [self._release_item("concurrency#global"), self._release_item(f"concurrency#tenant#{tenant_id}")]
         if lease_token is not None:
             items.append(
@@ -203,6 +172,7 @@ class DynamoDbConcurrencyLimiter:
                     "Delete": {
                         "TableName": self._table_name,
                         "Key": {"pk": {"S": self._lease_pk(tenant_id, lease_token)}},
+                        "ConditionExpression": "attribute_exists(pk)",
                     }
                 }
             )
@@ -216,8 +186,20 @@ class DynamoDbConcurrencyLimiter:
                 return
             raise
 
+    def renew(self, tenant_id: str, lease_token: str) -> None:
+        self._client.update_item(
+            TableName=self._table_name,
+            Key={"pk": {"S": self._lease_pk(tenant_id, lease_token)}},
+            UpdateExpression="SET lease_expires_at = :expiry",
+            ConditionExpression="attribute_exists(pk) AND lease_expires_at > :now",
+            ExpressionAttributeValues={
+                ":expiry": {"N": str(time.time() + self._lease_ttl_s)},
+                ":now": {"N": str(time.time())},
+            },
+        )
+
     def reconcile(self, *, now: Optional[float] = None) -> int:
-        """Sweeps lease items whose `expires_at` has passed and
+        """Sweeps lease items whose `lease_expires_at` has passed and
         compensates the counters they represent -- see this class's
         own docstring for why this, not native TTL alone, is the real
         fix for the crash-leak. Returns how many stale leases were
@@ -239,7 +221,8 @@ class DynamoDbConcurrencyLimiter:
         swept = 0
         scan_kwargs: Dict[str, Any] = {
             "TableName": self._table_name,
-            "FilterExpression": "begins_with(pk, :prefix) AND expires_at < :now",
+            "FilterExpression": "begins_with(pk, :prefix) AND (lease_expires_at < :now OR "
+                "(attribute_not_exists(lease_expires_at) AND expires_at < :now))",
             "ExpressionAttributeValues": {":prefix": {"S": "lease#"}, ":now": {"N": str(now)}},
         }
         while True:
@@ -256,7 +239,9 @@ class DynamoDbConcurrencyLimiter:
                                 "Delete": {
                                     "TableName": self._table_name,
                                     "Key": {"pk": {"S": lease_pk}},
-                                    "ConditionExpression": "attribute_exists(pk)",
+                                    "ConditionExpression": "attribute_exists(pk) AND (lease_expires_at < :now OR "
+                                        "(attribute_not_exists(lease_expires_at) AND expires_at < :now))",
+                                    "ExpressionAttributeValues": {":now": {"N": str(now)}},
                                 }
                             },
                         ]
@@ -354,6 +339,10 @@ async def try_acquire_with_wait(
         await sleep(poll_interval_s)
 
 
+class BlockingCallCapacityError(Exception):
+    pass
+
+
 class BlockingCallTimeoutError(Exception):
     pass
 
@@ -362,18 +351,60 @@ class BlockingCallRunner:
     def __init__(self, *, max_workers: int, default_timeout_s: float):
         self._executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="blocking-call")
         self._default_timeout_s = default_timeout_s
+        self._slots = threading.BoundedSemaphore(max_workers)
 
     async def run(
         self, func: Callable[..., T], *args: Any, timeout_s: Optional[float] = None, **kwargs: Any
     ) -> T:
-        loop = asyncio.get_running_loop()
+        if not self._slots.acquire(blocking=False):
+            raise BlockingCallCapacityError("blocking executor is saturated")
         bound = partial(func, *args, **kwargs)
         try:
+            future = self._executor.submit(contextvars.copy_context().run, bound)
+        except BaseException:
+            self._slots.release()
+            raise
+        future.add_done_callback(lambda _: self._slots.release())
+        wrapped = asyncio.wrap_future(future)
+        # Retrieve eventual errors even after the HTTP waiter has departed.
+        wrapped.add_done_callback(lambda done: None if done.cancelled() else done.exception())
+        try:
             return await asyncio.wait_for(
-                loop.run_in_executor(self._executor, bound),
+                asyncio.shield(wrapped),
                 timeout=timeout_s if timeout_s is not None else self._default_timeout_s,
             )
         except asyncio.TimeoutError as exc:
+            future.cancel()  # Cancel queued work only; running work retains its lease.
             raise BlockingCallTimeoutError(
                 f"blocking call exceeded {timeout_s if timeout_s is not None else self._default_timeout_s}s"
             ) from exc
+        except asyncio.CancelledError:
+            future.cancel()
+            raise
+
+
+@contextmanager
+def maintained_lease(limiter, tenant_id: str, token: str):
+    """Renew while work runs; release only after the underlying work ends.
+
+    Renewal failure is reported, not hidden. A network partition cannot
+    forcibly cancel a remote inference; callers must still use SDK timeouts.
+    """
+    stopped = threading.Event()
+    thread = None
+    if hasattr(limiter, "renew"):
+        def heartbeat():
+            while not stopped.wait(max(0.01, limiter._lease_ttl_s / 3)):
+                try:
+                    limiter.renew(tenant_id, token)
+                except Exception:
+                    logging.getLogger(__name__).exception("concurrency lease renewal failed")
+        thread = threading.Thread(target=heartbeat, daemon=True)
+        thread.start()
+    try:
+        yield
+    finally:
+        stopped.set()
+        if thread is not None:
+            thread.join()
+        limiter.release(tenant_id, token)

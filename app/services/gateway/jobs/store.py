@@ -7,10 +7,13 @@ when settings.jobs_table_name is set.
 from __future__ import annotations
 
 import threading
+import dataclasses
+import time
+import uuid
 from decimal import Decimal
 from typing import Any, Dict, Protocol
 
-from .models import Job, JobMessage, JobNotFoundError, JobStatus
+from .models import Job, JobMessage, JobNotFoundError, JobStatus, JobBusyError
 
 
 class JobStore(Protocol):
@@ -21,6 +24,12 @@ class JobStore(Protocol):
     def get(self, job_id: str) -> Job:
         """Raises JobNotFoundError if job_id doesn't exist."""
         ...
+
+    def claim(self, job_id: str, lease_s: float = 120) -> Job: ...
+
+    def renew(self, job: Job, lease_s: float = 120) -> None: ...
+
+    def finish(self, job: Job) -> None: ...
 
 
 class InMemoryJobStore:
@@ -39,6 +48,34 @@ class InMemoryJobStore:
             except KeyError:
                 raise JobNotFoundError(job_id) from None
 
+    def claim(self, job_id: str, lease_s: float = 120) -> Job:
+        with self._lock:
+            if job_id not in self._jobs:
+                raise JobNotFoundError(job_id)
+            job = self._jobs[job_id]
+            if job.status in (JobStatus.SUCCEEDED, JobStatus.FAILED):
+                return job
+            if job.status == JobStatus.RUNNING and (job.lease_expires_at or 0) > time.time():
+                raise JobBusyError(job_id)
+            job = dataclasses.replace(job, status=JobStatus.RUNNING,
+                                      execution_id=str(uuid.uuid4()), lease_expires_at=time.time() + lease_s)
+            self._jobs[job_id] = job
+            return job
+
+    def renew(self, job: Job, lease_s: float = 120) -> None:
+        with self._lock:
+            current = self._jobs[job.job_id]
+            if current.status != JobStatus.RUNNING or current.execution_id != job.execution_id:
+                raise JobBusyError(job.job_id)
+            self._jobs[job.job_id] = dataclasses.replace(current, lease_expires_at=time.time() + lease_s)
+
+    def finish(self, job: Job) -> None:
+        with self._lock:
+            current = self._jobs[job.job_id]
+            if current.status != JobStatus.RUNNING or current.execution_id != job.execution_id:
+                raise JobBusyError(job.job_id)
+            self._jobs[job.job_id] = job
+
 
 def _job_to_item(job: Job) -> Dict[str, Any]:
     # DynamoDB's Number type rejects Python float directly (boto3 raises
@@ -56,6 +93,8 @@ def _job_to_item(job: Job) -> Dict[str, Any]:
         "created_at": Decimal(str(job.created_at)),
     }
     for key, value in (
+        ("execution_id", job.execution_id),
+        ("lease_expires_at", Decimal(str(job.lease_expires_at)) if job.lease_expires_at is not None else None),
         ("output", job.output),
         ("error_code", job.error_code),
         ("error_message", job.error_message),
@@ -78,6 +117,8 @@ def _item_to_job(item: Dict[str, Any]) -> Job:
         max_tokens=int(item["max_tokens"]),
         temperature=float(item["temperature"]),
         created_at=float(item["created_at"]),
+        execution_id=item.get("execution_id"),
+        lease_expires_at=float(item["lease_expires_at"]) if "lease_expires_at" in item else None,
         output=item.get("output"),
         error_code=item.get("error_code"),
         error_message=item.get("error_message"),
@@ -101,8 +142,50 @@ class DynamoDbJobStore:
         self._table.put_item(Item=_job_to_item(job))
 
     def get(self, job_id: str) -> Job:
-        response = self._table.get_item(Key={"job_id": job_id})
+        response = self._table.get_item(Key={"job_id": job_id}, ConsistentRead=True)
         item = response.get("Item")
         if item is None:
             raise JobNotFoundError(job_id)
         return _item_to_job(item)
+
+
+    def claim(self, job_id: str, lease_s: float = 120) -> Job:
+        from botocore.exceptions import ClientError
+        try:
+            result = self._table.update_item(
+                Key={"job_id": job_id},
+                UpdateExpression="SET #status = :running, execution_id = :owner, lease_expires_at = :expiry",
+                ConditionExpression="attribute_exists(job_id) AND (#status = :queued OR "
+                    "(#status = :running AND (attribute_not_exists(lease_expires_at) OR lease_expires_at < :now)))",
+                ExpressionAttributeNames={"#status": "status"},
+                ExpressionAttributeValues={":running": "RUNNING", ":queued": "QUEUED",
+                    ":owner": str(uuid.uuid4()), ":expiry": Decimal(str(time.time() + lease_s)),
+                    ":now": Decimal(str(time.time()))},
+                ReturnValues="ALL_NEW",
+            )
+            return _item_to_job(result["Attributes"])
+        except ClientError as exc:
+            if exc.response["Error"]["Code"] != "ConditionalCheckFailedException":
+                raise
+            job = self.get(job_id)
+            if job.status in (JobStatus.SUCCEEDED, JobStatus.FAILED):
+                return job
+            raise JobBusyError(job_id) from exc
+
+    def renew(self, job: Job, lease_s: float = 120) -> None:
+        self._table.update_item(
+            Key={"job_id": job.job_id},
+            UpdateExpression="SET lease_expires_at = :expiry",
+            ConditionExpression="execution_id = :owner AND #status = :running",
+            ExpressionAttributeNames={"#status": "status"},
+            ExpressionAttributeValues={":owner": job.execution_id, ":running": "RUNNING",
+                ":expiry": Decimal(str(time.time() + lease_s))},
+        )
+
+    def finish(self, job: Job) -> None:
+        self._table.put_item(
+            Item=_job_to_item(job),
+            ConditionExpression="execution_id = :owner AND #status = :running",
+            ExpressionAttributeNames={"#status": "status"},
+            ExpressionAttributeValues={":owner": job.execution_id, ":running": "RUNNING"},
+        )

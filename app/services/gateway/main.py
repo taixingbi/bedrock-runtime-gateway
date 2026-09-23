@@ -33,9 +33,8 @@ from .auth.enterprise_groups import EnterpriseGroupResolver, FileEnterpriseGroup
 from .auth.jwt_verifier import JwksVerifier, StaticKeyVerifier, TokenVerifier
 from .cache.store import InMemoryResponseCache, ResponseCache
 from .config import Settings, load_settings
-from .guardrails.basic_guardrail import BasicGuardrailClient
-from .concurrency import BlockingCallRunner, ConcurrencyLimiter, DynamoDbConcurrencyLimiter
-from .guardrails.bedrock_guardrail import BedrockGuardrailClient
+from .dependencies import build_policy_store, build_guardrail_client, build_concurrency_limiter
+from .concurrency import BlockingCallRunner, ConcurrencyLimiter
 from .guardrails.client import GuardrailClient
 from .inference.bedrock_client import BedrockClient, ConverseClient
 from .jobs.queue import InMemoryJobQueue, JobQueue, SqsJobQueue
@@ -44,9 +43,7 @@ from .policy.cache import PolicySnapshotCache
 from .policy.rate_limiter import DynamoDbRateLimiter, TokenBucketRateLimiter
 from .policy.store import (
     DynamoDbPolicyStore,
-    FilePolicyStore,
     InMemoryPolicyStore,
-    LayeredPolicyStore,
     PolicyStore,
     ProvisionedPolicyStore,
 )
@@ -169,34 +166,11 @@ def create_app(
             )
         )
     if policy_store is None:
-        policy_store = LayeredPolicyStore(
-            primary=policy_store_primary,
-            fallback=FilePolicyStore(settings.tenant_policy_path),
-        )
+        policy_store = build_policy_store(settings, primary=policy_store_primary)
     if guardrail_client is None:
-        guardrail_client = (
-            BedrockGuardrailClient(
-                guardrail_id=settings.bedrock_guardrail_id,
-                guardrail_version=settings.bedrock_guardrail_version,
-                region=settings.aws_region,
-            )
-            if settings.bedrock_guardrail_id
-            else BasicGuardrailClient()
-        )
+        guardrail_client = build_guardrail_client(settings)
     if concurrency_limiter is None:
-        concurrency_limiter = (
-            DynamoDbConcurrencyLimiter(
-                table_name=settings.admission_control_table_name, region=settings.aws_region,
-                global_max=settings.concurrency_global_max,
-                default_tenant_max=settings.concurrency_default_tenant_max,
-                lease_ttl_s=settings.concurrency_lease_ttl_s,
-            )
-            if settings.admission_control_table_name
-            else ConcurrencyLimiter(
-                global_max=settings.concurrency_global_max,
-                default_tenant_max=settings.concurrency_default_tenant_max,
-            )
-        )
+        concurrency_limiter = build_concurrency_limiter(settings)
     if rate_limiter is None:
         rate_limiter = (
             DynamoDbRateLimiter(

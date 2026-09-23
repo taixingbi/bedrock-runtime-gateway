@@ -21,3 +21,8 @@ from ..telemetry import otel as _otel
 if not _otel._configured:
     trace.set_tracer_provider(TracerProvider(resource=Resource.create({"service.name": "gateway-api-test"})))
     _otel._configured = True
+
+# Integration tests use explicit file fixtures, independent of dev's DynamoDB-only configuration.
+import os
+from pathlib import Path
+os.environ.setdefault("TENANT_POLICY_PATH", str(Path(__file__).parent / "fixtures" / "tenants.yaml"))

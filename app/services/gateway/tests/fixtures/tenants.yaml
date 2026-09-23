@@ -1,0 +1,38 @@
+# Independent integration-test policies; never deployed or synchronized.
+tenants:
+  tenant1-finance:
+    state: ACTIVE
+    models:
+    - us.amazon.nova-micro-v1:0
+    - us.amazon.nova-lite-v1:0
+    - us.meta.llama3-3-70b-instruct-v1:0
+    - qwen.qwen3-32b-v1:0
+    - us.amazon.nova-pro-v1:0
+    rpm_limit: 300
+    guardrail_policy: finance-v1
+    route_set: finance-chat-v1
+    slo:
+      p95_latency_ms: 3000
+    policy_epoch: 1
+    monthly_budget: 10000
+    queue_enabled: true
+  tenant2-search:
+    state: ACTIVE
+    models:
+    - us.amazon.nova-micro-v1:0
+    - us.amazon.nova-lite-v1:0
+    - us.meta.llama3-3-70b-instruct-v1:0
+    - qwen.qwen3-32b-v1:0
+    - us.amazon.nova-pro-v1:0
+    rpm_limit: 120
+    guardrail_policy: standard-v1
+    route_set: search-chat-v1
+    slo:
+      p95_latency_ms: 5000
+    policy_epoch: 1
+  tenant0-sandbox:
+    state: ACTIVE
+    models: []
+    rpm_limit: 30
+    guardrail_policy: standard-v1
+    policy_epoch: 1

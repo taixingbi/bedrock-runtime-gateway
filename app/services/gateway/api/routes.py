@@ -16,6 +16,8 @@ so callers see no difference from before the migration.
 """
 from __future__ import annotations
 
+import asyncio
+from contextvars import ContextVar
 import time
 import uuid
 from typing import Dict, Optional
@@ -31,7 +33,7 @@ from ..auth.enterprise_groups import EnterpriseGroupResolver
 from ..auth.jwt_verifier import TokenVerifier
 from ..cache.keys import build_cache_key, normalize_messages
 from ..cache.store import CachedResponse, ResponseCache
-from ..concurrency import BlockingCallRunner, BlockingCallTimeoutError, ConcurrencyLimiter, try_acquire_with_wait
+from ..concurrency import BlockingCallRunner, BlockingCallTimeoutError, BlockingCallCapacityError, ConcurrencyLimiter, maintained_lease
 from ..config import Settings
 from ..guardrails.client import GuardrailClient
 from ..inference.bedrock_client import BedrockChatMessage, BedrockInvocationError
@@ -47,7 +49,7 @@ from ..telemetry.logging import get_logger, log_event
 from ..telemetry.otel import set_span_attributes
 from ..telemetry.request_audit import RequestAuditEvent, RequestAuditStore, current_trace_id
 from ..telemetry.slo import slo_breached
-from ..usage.store import UsageStore, add_and_get_application, current_day, current_month
+from ..usage.store import UsageStore, record_provider_usage, current_day, current_month
 from .errors import error_response as _error
 from .schemas import ChatRequest, ChatResponse, Usage
 
@@ -86,50 +88,41 @@ def build_router(
 ) -> APIRouter:
     api_router = APIRouter()
 
+    audit_context = ContextVar("chat_audit", default=None)
+
     async def _run_blocking_limited(tenant_policy, func, *args, **kwargs):
-        """Plan section 16's concurrency fix: acquire a fast-reject slot
-        (tenant + global), run `func` off the event loop with a total
-        timeout, always release the slot after -- whatever `func` itself
-        raises (guardrail BLOCK, BedrockInvocationError, ...) propagates
-        to the caller unchanged; this only adds admission control and
-        thread offload around it.
-
-        `tenant_policy` (not `policy` -- every call site also forwards
-        its own `policy=policy` kwarg through **kwargs to `func` itself,
-        e.g. pipeline.check_input_guardrail; naming both the same
-        collides as "multiple values for argument 'policy'", caught
-        live by this file's own test suite) opts a tenant into a
-        bounded wait-and-retry for a slot instead of the immediate 429
-        via its queue_enabled field -- see
-        concurrency.try_acquire_with_wait's own docstring for why this
-        is a queue in this platform's Admit/Queue/Reject vocabulary,
-        not a real message queue."""
-        tenant_id = tenant_policy.tenant_id
-        if tenant_policy.queue_enabled:
-            lease_token = await try_acquire_with_wait(
-                concurrency_limiter, tenant_id,
-                tenant_max=tenant_policy.max_concurrency, max_wait_s=tenant_policy.queue_max_wait_s,
-            )
-        else:
-            lease_token = concurrency_limiter.try_acquire(tenant_id, tenant_max=tenant_policy.max_concurrency)
-        if not lease_token:
-            raise pipeline.PipelineError(
-                429, "CONCURRENCY_LIMIT_EXCEEDED",
-                f"tenant '{tenant_id}' exceeded its concurrent-request limit, or the gateway is globally saturated",
-            )
+        # Acquire and release inside the executor operation. HTTP cancellation
+        # cannot free capacity while the SDK call continues in that thread.
+        def execute():
+            deadline = time.monotonic() + (tenant_policy.queue_max_wait_s if tenant_policy.queue_enabled else 0)
+            while True:
+                token = concurrency_limiter.try_acquire(
+                    tenant_policy.tenant_id, tenant_max=tenant_policy.max_concurrency,
+                )
+                if token:
+                    break
+                if time.monotonic() >= deadline:
+                    raise pipeline.PipelineError(429, "CONCURRENCY_LIMIT_EXCEEDED", "inference capacity exhausted")
+                time.sleep(0.1)
+            with maintained_lease(concurrency_limiter, tenant_policy.tenant_id, token):
+                return func(*args, **kwargs)
         try:
-            return await blocking_call_runner.run(func, *args, **kwargs)
-        finally:
-            concurrency_limiter.release(tenant_id, lease_token)
+            return await blocking_call_runner.run(execute)
+        except BlockingCallCapacityError as exc:
+            raise pipeline.PipelineError(429, "CONCURRENCY_LIMIT_EXCEEDED", str(exc)) from exc
 
-    def _record_usage(tenant_id: str, application_id: str, cost: float) -> None:
-        """Plan section 34.7: records spend at the tenant-monthly level
-        (M8, unchanged), tenant-daily, and per-application level (both
-        new) -- see usage/store.py's add_and_get_application/
-        current_day for why this needs no new store/table."""
-        usage_store.add_and_get(tenant_id, current_month(), cost)
-        usage_store.add_and_get(tenant_id, current_day(), cost)
-        add_and_get_application(usage_store, tenant_id, application_id, current_month(), cost)
+    def _finalize(audit, status):
+        identity = audit.get("identity")
+        if identity is None or audit.get("written") or request_audit_store is None:
+            return
+        fields = {key: value for key, value in audit.items()
+                  if key not in ("identity", "written")}
+        fields["status"] = status
+        request_audit_store.write(RequestAuditEvent(
+            tenant_id=identity.tenant_id, application_id=identity.application_id,
+            principal=identity.sub, timestamp=time.time(), **fields,
+        ))
+        audit["written"] = True
 
     def _write_audit(
         *,
@@ -147,34 +140,10 @@ def build_router(
         output_tokens: Optional[int] = None,
         estimated_cost: Optional[float] = None,
     ) -> None:
-        """Plan section 34.4: one durable, metadata-only record per
-        request -- see telemetry/request_audit.py's module docstring
-        for why this is safe to write unconditionally (no-op if
-        request_audit_store isn't configured, same optional-infra
-        pattern audit_store/S3AuditStore already use)."""
-        if request_audit_store is None:
-            return
-        request_audit_store.write(
-            RequestAuditEvent(
-                request_id=request_id,
-                tenant_id=identity.tenant_id,
-                application_id=identity.application_id,
-                principal=identity.sub,
-                action=action,
-                status=status,
-                trace_id=current_trace_id(),
-                model=model,
-                policy_version=policy_version,
-                authz_decision=authz_decision,
-                decision_id=decision_id,
-                guardrail_version=guardrail_version,
-                guardrail_action=guardrail_action,
-                input_tokens=input_tokens,
-                output_tokens=output_tokens,
-                estimated_cost=estimated_cost,
-                timestamp=time.time(),
-            )
-        )
+        audit = audit_context.get()
+        if audit is not None:
+            audit.update({key: value for key, value in locals().items()
+                          if (key in RequestAuditEvent.__dataclass_fields__ or key == "identity") and value is not None})
 
     @api_router.get("/healthz")
     async def healthz() -> dict:
@@ -182,6 +151,21 @@ def build_router(
 
     @api_router.post("/v1/chat", response_model=ChatResponse, response_model_exclude_none=True)
     async def chat(request: Request, chat_request: ChatRequest):
+        audit = {"request_id": getattr(request.state, "request_id", str(uuid.uuid4())),
+                 "action": "chat.completion", "trace_id": current_trace_id()}
+        context_token = audit_context.set(audit)
+        try:
+            response = await _chat(request, chat_request)
+            if not isinstance(response, StreamingResponse):
+                await asyncio.to_thread(_finalize, audit, response.status_code)
+            return response
+        except BaseException as exc:
+            await asyncio.to_thread(_finalize, audit, 499 if isinstance(exc, asyncio.CancelledError) else 500)
+            raise
+        finally:
+            audit_context.reset(context_token)
+
+    async def _chat(request: Request, chat_request: ChatRequest):
         request_id = getattr(request.state, "request_id", str(uuid.uuid4()))
         session_id = getattr(request.state, "session_id", "")
 
@@ -207,11 +191,16 @@ def build_router(
                 set_span_attributes(span, status=exc.status_code, error=str(exc))
                 return _error(exc.status_code, exc.code, str(exc), request_id)
 
+            audit = audit_context.get()
+            audit["identity"] = identity
+            audit["authz_decision"] = "DENY"
             try:
                 authz = pipeline.authorize(
                     identity, required_role=settings.chat_required_role, action="chat.completion"
                 )
+                audit.update(authz_decision="ALLOW", decision_id=authz.decision_id)
                 policy = pipeline.resolve_policy(identity, policy_cache=policy_cache)
+                audit["policy_version"] = policy.policy_epoch
             except pipeline.PipelineError as exc:
                 set_span_attributes(span, status=exc.status_code, error=str(exc))
                 # A role-check failure here IS a real authz DENY (unlike
@@ -294,8 +283,11 @@ def build_router(
                 )
             except pipeline.PipelineError as exc:
                 set_span_attributes(span, status=exc.status_code, error=str(exc))
+                if exc.status_code == 403:
+                    audit["authz_decision"] = "DENY"
                 return _error(exc.status_code, exc.code, str(exc), request_id)
 
+            audit["model"] = model_id
             set_span_attributes(span, model=model_id)
 
             combined_input_text = "\n".join(m.content for m in chat_request.messages)
@@ -358,14 +350,40 @@ def build_router(
                         f"model '{model_id}' is temporarily unavailable (circuit open)",
                         request_id,
                     )
-                chunk_iter = router_converse_stream(
-                    router, model_id=model_id, messages=messages,
-                    max_tokens=chat_request.max_tokens, temperature=chat_request.temperature,
-                )
+                # Iterator construction and consumption happen off the event loop;
+                # the lease covers the entire upstream stream, including disconnect cleanup.
+                invocation_id = str(uuid.uuid4())
+                def stream_chunks():
+                    token = concurrency_limiter.try_acquire(identity.tenant_id, tenant_max=policy.max_concurrency)
+                    if not token:
+                        raise pipeline.PipelineError(429, "CONCURRENCY_LIMIT_EXCEEDED", "inference capacity exhausted")
+                    with maintained_lease(concurrency_limiter, identity.tenant_id, token):
+                        chunks = router_converse_stream(
+                            router, model_id=model_id, messages=messages,
+                            max_tokens=chat_request.max_tokens, temperature=chat_request.temperature,
+                        )
+                        try:
+                            yield from chunks
+                        finally:
+                            close = getattr(chunks, "close", None)
+                            if close:
+                                close()
+                def complete_stream(final, status):
+                    try:
+                        if final is not None and final.input_tokens is not None and final.output_tokens is not None:
+                            cost = estimate_cost(model_id, input_tokens=final.input_tokens, output_tokens=final.output_tokens)
+                            record_provider_usage(usage_store, identity.tenant_id, identity.application_id,
+                                                  cost, invocation_id=invocation_id)
+                            audit.update(input_tokens=final.input_tokens, output_tokens=final.output_tokens,
+                                         estimated_cost=cost)
+                    finally:
+                        _finalize(audit, status)
+                chunk_iter = stream_chunks()
                 set_span_attributes(span, status=200, stream=True)
                 return StreamingResponse(
                     stream_chat_response(
                         chunk_iter,
+                        on_complete=complete_stream,
                         model_id=model_id,
                         request_id=request_id,
                         tenant_id=identity.tenant_id,
@@ -388,10 +406,8 @@ def build_router(
             cached = response_cache.get(cache_key)
 
             if cached is not None:
-                estimated_cost = estimate_cost(
-                    cached.model_id, input_tokens=cached.input_tokens, output_tokens=cached.output_tokens
-                )
-                _record_usage(identity.tenant_id, identity.application_id, estimated_cost)
+                # Application response-cache hits perform no provider inference.
+                estimated_cost = 0.0
                 payload_ref = None
                 if policy.debug_capture_enabled:
                     debug_capture_store.capture(
@@ -446,9 +462,17 @@ def build_router(
 
             start = time.perf_counter()
             try:
+                invocation_id = str(uuid.uuid4())
+                def invoke_and_account(**kwargs):
+                    routed = router.converse(**kwargs)
+                    result = routed.result
+                    cost = estimate_cost(routed.model_id, input_tokens=result.input_tokens, output_tokens=result.output_tokens)
+                    record_provider_usage(usage_store, identity.tenant_id, identity.application_id,
+                                          cost, invocation_id=invocation_id)
+                    return routed
                 routed = await _run_blocking_limited(
                     policy,
-                    router.converse,
+                    invoke_and_account,
                     primary_model_id=model_id,
                     route_set_name=policy.route_set,
                     messages=messages,
@@ -498,6 +522,9 @@ def build_router(
                 return _error(exc.status_code, exc.code, str(exc), request_id)
 
             result = routed.result
+            audit.update(model=routed.model_id, input_tokens=result.input_tokens, output_tokens=result.output_tokens,
+                         estimated_cost=estimate_cost(routed.model_id, input_tokens=result.input_tokens,
+                                                      output_tokens=result.output_tokens))
 
             guardrail_start = time.perf_counter()
             try:
@@ -521,6 +548,7 @@ def build_router(
                 )
                 return _error(504, "UPSTREAM_TIMEOUT", str(exc), request_id)
             except pipeline.PipelineError as exc:
+                audit.update(guardrail_action="BLOCK", guardrail_version=policy.guardrail_policy)
                 output_guardrail_ms = round((time.perf_counter() - guardrail_start) * 1000, 2)
                 set_span_attributes(
                     span, status=exc.status_code, error=str(exc), model=routed.model_id,
@@ -567,7 +595,6 @@ def build_router(
             estimated_cost = estimate_cost(
                 routed.model_id, input_tokens=result.input_tokens, output_tokens=result.output_tokens
             )
-            _record_usage(identity.tenant_id, identity.application_id, estimated_cost)
             breached = slo_breached(policy, result.latency_ms)
 
             set_span_attributes(

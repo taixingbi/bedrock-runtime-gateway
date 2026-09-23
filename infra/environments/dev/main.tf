@@ -847,19 +847,27 @@ module "worker_service" {
   dynamodb_table_arn = aws_dynamodb_table.jobs.arn
   usage_table_arn    = aws_dynamodb_table.usage.arn
 
+  tenant_policies_table_arn   = aws_dynamodb_table.provisioned_tenant_policies.arn
+  admission_control_table_arn = aws_dynamodb_table.admission_control.arn
+  guardrail_arn               = aws_bedrock_guardrail.this.guardrail_arn
+
   container_env = {
-    AWS_REGION            = var.aws_region
-    BEDROCK_MODEL_ID      = var.bedrock_model_ids[0]
-    SERVICE_NAME          = "${local.name_prefix}-worker"
-    SERVICE               = "bedrock-gateway-worker"
-    ENVIRONMENT           = "dev"
-    LOG_LEVEL             = "INFO"
-    ROUTE_SET_CONFIG_PATH = "policies/route_sets.yaml"
-    TENANT_POLICY_PATH    = "policies/tenants.yaml"
-    IAM_TENANTS_PATH      = "policies/iam_tenants.yaml"
-    JOBS_QUEUE_URL        = aws_sqs_queue.jobs.url
-    JOBS_TABLE_NAME       = aws_dynamodb_table.jobs.name
-    USAGE_TABLE_NAME      = aws_dynamodb_table.usage.name
+    PROVISIONED_TENANT_POLICIES_TABLE_NAME = aws_dynamodb_table.provisioned_tenant_policies.name
+    ADMISSION_CONTROL_TABLE_NAME           = aws_dynamodb_table.admission_control.name
+    BEDROCK_GUARDRAIL_ID                   = aws_bedrock_guardrail.this.guardrail_id
+    BEDROCK_GUARDRAIL_VERSION              = aws_bedrock_guardrail_version.v1.version
+    AWS_REGION                             = var.aws_region
+    BEDROCK_MODEL_ID                       = var.bedrock_model_ids[0]
+    SERVICE_NAME                           = "${local.name_prefix}-worker"
+    SERVICE                                = "bedrock-gateway-worker"
+    ENVIRONMENT                            = "dev"
+    LOG_LEVEL                              = "INFO"
+    ROUTE_SET_CONFIG_PATH                  = "policies/route_sets.yaml"
+    TENANT_POLICY_PATH                     = "policies/tenants.yaml"
+    IAM_TENANTS_PATH                       = "policies/iam_tenants.yaml"
+    JOBS_QUEUE_URL                         = aws_sqs_queue.jobs.url
+    JOBS_TABLE_NAME                        = aws_dynamodb_table.jobs.name
+    USAGE_TABLE_NAME                       = aws_dynamodb_table.usage.name
   }
 }
 

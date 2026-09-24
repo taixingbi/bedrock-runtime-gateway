@@ -1,12 +1,20 @@
 #!/usr/bin/env python3
-"""Pulls each certified model's real AWS Bedrock account quota
-(requests-per-minute) from AWS Service Quotas and writes it into
-gateway-model-quotas-dev's "quota#<model_id>" row -- the source
-routing/model_quota.py's ModelQuotaCache reads at request time, so
-routing/router.py's CertifiedRouter can skip a model before attempting
-a call Bedrock would throttle anyway, rather than only reacting after
-the fact (the existing fallback-on-ThrottlingException path, which
-this doesn't replace -- see model_quota.py's own docstring).
+"""Pulls each certified model's real AWS Bedrock account quota --
+requests-per-minute AND tokens-per-minute -- from AWS Service Quotas
+and writes them into gateway-model-quotas-dev's "quota#<model_id>" row
+-- the source routing/model_quota.py's ModelQuotaCache reads at
+request time, so routing/router.py's CertifiedRouter can skip a model
+before attempting a call Bedrock would throttle anyway, rather than
+only reacting after the fact (the existing fallback-on-
+ThrottlingException path, which this doesn't replace -- see
+model_quota.py's own docstring).
+
+RPM is required for a model to sync at all (unchanged from before TPM
+support existed); TPM is best-effort on top of that -- a model with a
+real RPM quota but no discoverable TPM quota in this account/region
+still syncs (RPM-only), it isn't skipped outright, since RPM gating
+alone is strictly better than no gating while TPM support catches up
+for that model.
 
 Not guessed, not hardcoded: Bedrock's own quotas vary per account
 (adjustable quotas can be raised via a support request) and change
@@ -17,23 +25,24 @@ this repo.
 Model-id-to-quota-name mapping: this gateway's model IDs
 (certified_models.yaml) are either a "us."-prefixed cross-region
 inference profile or a bare on-demand model ID -- Service Quotas names
-each quota "{Cross-region|On-demand} model inference requests per
-minute for <human model name>", and there's no API that maps a
-model_id to that display name directly, so MODEL_QUOTA_NAMES below is
-hand-maintained. Add an entry there before this script can sync a
-newly-certified model -- an unmapped model is skipped with a warning,
-not a hard failure, and (deliberately) so is a mapped model whose named
-quota isn't found in this account/region -- see model_quota.py's own
-"fails open on an unknown model" reasoning; a model this script has
-never successfully synced just gets no quota gate, not a stale/wrong
-one.
+each pair of quotas "{Cross-region|On-demand} model inference
+{requests|tokens} per minute for <human model name>" (the RPM and TPM
+names differ only in "requests" vs "tokens"), and there's no API that
+maps a model_id to that display name directly, so MODEL_QUOTA_NAMES
+below is hand-maintained. Add an entry there before this script can
+sync a newly-certified model -- an unmapped model is skipped with a
+warning, not a hard failure, and (deliberately) so is a mapped model
+whose named RPM quota isn't found in this account/region -- see
+model_quota.py's own "fails open on an unknown model" reasoning; a
+model this script has never successfully synced just gets no quota
+gate, not a stale/wrong one.
 
 Idempotent and safe to re-run: writes only the "quota#<model_id>"
-row's rpm_limit/quota_type/updated_at via update_item, never touching
-the separate "ratelimit#model#<model_id>" row ModelQuotaLimiter's live
-token bucket owns -- re-running this never resets an in-flight
-rate-limit window. Dry-run by default -- --apply is required to
-actually write.
+row's rpm_limit/tpm_limit/quota_type/updated_at via update_item, never
+touching the separate "ratelimit#model#<model_id>"/
+"ratelimit#model_tpm#<model_id>" rows ModelQuotaLimiter's live token
+buckets own -- re-running this never resets an in-flight rate-limit
+window. Dry-run by default -- --apply is required to actually write.
 
 sync_quotas() below is deliberately client-injectable and argv-free
 (main() is the thin CLI wrapper that constructs real boto3 clients
@@ -88,30 +97,44 @@ def sync_quotas(
     skipped: List[Tuple[str, str]] = []
     for model_id, (quota_name, is_cross_region) in model_quota_names.items():
         kind = "Cross-region" if is_cross_region else "On-demand"
-        full_name = f"{kind} model inference requests per minute for {quota_name}"
-        rpm_limit = by_name.get(full_name)
+        rpm_full_name = f"{kind} model inference requests per minute for {quota_name}"
+        tpm_full_name = f"{kind} model inference tokens per minute for {quota_name}"
+        rpm_limit = by_name.get(rpm_full_name)
         if rpm_limit is None:
-            skipped.append((model_id, full_name))
-            print(f"SKIP '{model_id}': quota '{full_name}' not found in this account/region", file=sys.stderr)
+            skipped.append((model_id, rpm_full_name))
+            print(f"SKIP '{model_id}': quota '{rpm_full_name}' not found in this account/region", file=sys.stderr)
             continue
 
         rpm_limit = int(rpm_limit)
+        tpm_value = by_name.get(tpm_full_name)
+        tpm_limit = int(tpm_value) if tpm_value is not None else None
+        if tpm_limit is None:
+            print(f"WARN '{model_id}': quota '{tpm_full_name}' not found -- syncing rpm_limit only", file=sys.stderr)
+
         if not apply:
-            print(f"[dry-run] would set '{model_id}' rpm_limit={rpm_limit} (from '{full_name}')")
+            tpm_note = f" tpm_limit={tpm_limit}" if tpm_limit is not None else " (no TPM quota found)"
+            print(f"[dry-run] would set '{model_id}' rpm_limit={rpm_limit}{tpm_note} (from '{rpm_full_name}')")
             continue
+
+        update_expression = "SET rpm_limit = :rpm, quota_type = :qt, updated_at = :ua"
+        expression_values = {
+            ":rpm": {"N": str(rpm_limit)},
+            ":qt": {"S": "cross_region" if is_cross_region else "on_demand"},
+            ":ua": {"N": str(int(time.time()))},
+        }
+        if tpm_limit is not None:
+            update_expression += ", tpm_limit = :tpm"
+            expression_values[":tpm"] = {"N": str(tpm_limit)}
 
         dynamo_client.update_item(
             TableName=table_name,
             Key={"pk": {"S": f"quota#{model_id}"}},
-            UpdateExpression="SET rpm_limit = :rpm, quota_type = :qt, updated_at = :ua",
-            ExpressionAttributeValues={
-                ":rpm": {"N": str(rpm_limit)},
-                ":qt": {"S": "cross_region" if is_cross_region else "on_demand"},
-                ":ua": {"N": str(int(time.time()))},
-            },
+            UpdateExpression=update_expression,
+            ExpressionAttributeValues=expression_values,
         )
         synced.append(model_id)
-        print(f"synced '{model_id}' rpm_limit={rpm_limit}")
+        tpm_suffix = f" tpm_limit={tpm_limit}" if tpm_limit is not None else ""
+        print(f"synced '{model_id}' rpm_limit={rpm_limit}{tpm_suffix}")
 
     return synced, skipped
 

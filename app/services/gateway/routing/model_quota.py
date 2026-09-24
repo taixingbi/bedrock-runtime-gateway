@@ -1,8 +1,20 @@
-"""Per-model requests-per-minute gate, protecting against exceeding
-AWS Bedrock's own account-wide on-demand/cross-region model quota
-(pulled from AWS Service Quotas by scripts/sync_model_quotas_from_aws.py
-into gateway-model-quotas-dev's rpm_limit attribute -- never guessed or
-hardcoded here; see that script's own docstring for why).
+"""Per-model requests-per-minute AND tokens-per-minute gate, protecting
+against exceeding AWS Bedrock's own account-wide on-demand/cross-region
+model quota (pulled from AWS Service Quotas by
+scripts/sync_model_quotas_from_aws.py into gateway-model-quotas-dev's
+rpm_limit/tpm_limit attributes -- never guessed or hardcoded here; see
+that script's own docstring for why).
+
+TPM is additive to RPM, never a replacement: AWS publishes both as
+independent quotas (e.g. nova-micro's cross-region quota is 400 RPM
+*and* 8,000,000 TPM -- a request pattern could exhaust either one
+first), so both are checked, and either one failing skips the
+candidate. TPM enforcement needs a per-call token estimate (unlike RPM,
+where every call is worth a flat 1) -- router.py computes this the same
+way pipeline.py's tenant-level TPM stage does (usage/token_estimate.py)
+and passes it in as `estimated_tokens`; a caller that doesn't pass one
+(or a model with no synced tpm_limit) simply skips the TPM gate, same
+fail-open convention as an unsynced rpm_limit.
 
 Wired into routing/router.py's per-candidate loop, the same place the
 circuit breaker gates a candidate -- an exhausted model's own quota is
@@ -94,28 +106,44 @@ class ModelQuotaCache:
 
             client = boto3.client("dynamodb", region_name=region)
         self._client = client
-        self._cache: Dict[str, Tuple[float, Optional[int]]] = {}
+        # (timestamp, rpm_limit, tpm_limit) -- both limits come from
+        # the same row/read, cached together so tpm_limit_for doesn't
+        # cost a second DynamoDB read on top of rpm_limit_for.
+        self._cache: Dict[str, Tuple[float, Optional[int], Optional[int]]] = {}
         self._lock = threading.Lock()
 
     def rpm_limit_for(self, model_id: str) -> Optional[int]:
         """None means "no synced quota for this model" -- callers must
         treat that as unknown, not zero (see this module's own
         fail-open docstring)."""
+        return self._quota_for(model_id)[0]
+
+    def tpm_limit_for(self, model_id: str) -> Optional[int]:
+        """None means "no synced TPM quota for this model" -- same
+        fail-open convention as rpm_limit_for. Distinct from "this
+        model has no TPM quota concept at all" (AWS publishes one for
+        every model this gate cares about; None here just means the
+        sync script hasn't captured it yet, or was run before TPM
+        support existed)."""
+        return self._quota_for(model_id)[1]
+
+    def _quota_for(self, model_id: str) -> Tuple[Optional[int], Optional[int]]:
         now = self._clock()
         with self._lock:
             cached = self._cache.get(model_id)
             if cached is not None and (now - cached[0]) < self._ttl_s:
-                return cached[1]
+                return cached[1], cached[2]
 
         response = self._client.get_item(
             TableName=self._table_name, Key={"pk": {"S": f"{_QUOTA_KEY_PREFIX}{model_id}"}}
         )
         item = response.get("Item")
         rpm_limit = int(item["rpm_limit"]["N"]) if item and "rpm_limit" in item else None
+        tpm_limit = int(item["tpm_limit"]["N"]) if item and "tpm_limit" in item else None
 
         with self._lock:
-            self._cache[model_id] = (now, rpm_limit)
-        return rpm_limit
+            self._cache[model_id] = (now, rpm_limit, tpm_limit)
+        return rpm_limit, tpm_limit
 
 
 class ModelQuotaLimiter:
@@ -126,6 +154,8 @@ class ModelQuotaLimiter:
         limiter: DynamoDbRateLimiter,
         tenant_limiter: Optional[DynamoDbRateLimiter] = None,
         per_tenant_share_pct: float = 0.4,
+        tpm_limiter: Optional[DynamoDbRateLimiter] = None,
+        tenant_tpm_limiter: Optional[DynamoDbRateLimiter] = None,
     ):
         self._cache = cache
         self._limiter = limiter
@@ -134,16 +164,33 @@ class ModelQuotaLimiter:
         # tenant_id behaves exactly as before this existed.
         self._tenant_limiter = tenant_limiter
         self._per_tenant_share_pct = per_tenant_share_pct
+        # Optional, additive to the RPM gate above: None (default)
+        # means no TPM gate at all -- a ModelQuotaLimiter built before
+        # TPM support existed, or one wired without a tpm_limiter,
+        # behaves exactly as it did before this existed.
+        self._tpm_limiter = tpm_limiter
+        self._tenant_tpm_limiter = tenant_tpm_limiter
 
-    def allow(self, model_id: str, tenant_id: Optional[str] = None) -> bool:
+    def allow(self, model_id: str, tenant_id: Optional[str] = None, *, estimated_tokens: Optional[int] = None) -> bool:
         rpm_limit = self._cache.rpm_limit_for(model_id)
-        if rpm_limit is None:
-            return True  # fail open -- see module docstring
-        if not self._limiter.allow(model_id, rpm_limit=rpm_limit):
-            return False
-        if tenant_id is not None and self._tenant_limiter is not None:
-            per_tenant_limit = max(1, int(rpm_limit * self._per_tenant_share_pct))
-            tenant_key = f"{model_id}#{tenant_id}"
-            if not self._tenant_limiter.allow(tenant_key, rpm_limit=per_tenant_limit):
+        if rpm_limit is not None:
+            if not self._limiter.allow(model_id, rpm_limit=rpm_limit):
                 return False
+            if tenant_id is not None and self._tenant_limiter is not None:
+                per_tenant_limit = max(1, int(rpm_limit * self._per_tenant_share_pct))
+                tenant_key = f"{model_id}#{tenant_id}"
+                if not self._tenant_limiter.allow(tenant_key, rpm_limit=per_tenant_limit):
+                    return False
+
+        if self._tpm_limiter is not None and estimated_tokens is not None:
+            tpm_limit = self._cache.tpm_limit_for(model_id)
+            if tpm_limit is not None:
+                if not self._tpm_limiter.allow(model_id, rpm_limit=tpm_limit, amount=estimated_tokens):
+                    return False
+                if tenant_id is not None and self._tenant_tpm_limiter is not None:
+                    per_tenant_tpm = max(1, int(tpm_limit * self._per_tenant_share_pct))
+                    tenant_key = f"{model_id}#{tenant_id}"
+                    if not self._tenant_tpm_limiter.allow(tenant_key, rpm_limit=per_tenant_tpm, amount=estimated_tokens):
+                        return False
+
         return True

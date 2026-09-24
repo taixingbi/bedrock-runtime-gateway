@@ -12,9 +12,11 @@ behaves like a direct call, M0's original behavior.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 from typing import Dict, List, Optional, Set
 
 from ..inference.bedrock_client import BedrockChatMessage, BedrockInvocationError, ConverseClient, ConverseResult
+from ..usage.token_estimate import estimate_tokens
 from .circuit_breaker import CircuitBreaker
 from .model_quota import ModelQuotaLimiter
 
@@ -121,11 +123,27 @@ class CertifiedRouter:
         candidates = [primary_model_id, *fallbacks]
         candidates = [m for m in candidates if m in self.certified_model_ids]
 
+        # Computed once, not per-candidate -- it depends only on this
+        # request's own messages/max_tokens, same estimate for every
+        # candidate model tried. None when there's no quota limiter at
+        # all, so a caller with model_quota_limiter=None pays zero cost
+        # for this (BedrockChatMessage has no .content attribute --
+        # SimpleNamespace adapts .text to what usage/token_estimate.py
+        # expects rather than changing that module's shared protocol
+        # for this one caller).
+        estimated_tokens = None
+        if self._model_quota_limiter is not None:
+            estimated_tokens = estimate_tokens(
+                (SimpleNamespace(content=m.text) for m in messages), max_tokens,
+            )
+
         last_error: Optional[BedrockInvocationError] = None
         for index, model_id in enumerate(candidates):
             if not self._breaker.allow(model_id):
                 continue
-            if self._model_quota_limiter is not None and not self._model_quota_limiter.allow(model_id, tenant_id):
+            if self._model_quota_limiter is not None and not self._model_quota_limiter.allow(
+                model_id, tenant_id, estimated_tokens=estimated_tokens
+            ):
                 continue
             try:
                 result = self.converse_client.converse(

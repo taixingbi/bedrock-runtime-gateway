@@ -304,7 +304,7 @@ class _QuotaLimiterStub:
     def __init__(self, *, deny):
         self._deny = set(deny)
 
-    def allow(self, model_id: str, tenant_id=None) -> bool:
+    def allow(self, model_id: str, tenant_id=None, *, estimated_tokens=None) -> bool:
         return model_id not in self._deny
 
 
@@ -316,7 +316,7 @@ class _RecordingQuotaLimiterStub:
     def __init__(self):
         self.calls = []
 
-    def allow(self, model_id: str, tenant_id=None) -> bool:
+    def allow(self, model_id: str, tenant_id=None, *, estimated_tokens=None) -> bool:
         self.calls.append((model_id, tenant_id))
         return True
 

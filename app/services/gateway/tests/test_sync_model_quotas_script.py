@@ -51,10 +51,15 @@ def _quota(name: str, value: float) -> dict:
 
 _FULL_QUOTA_SET = [
     _quota("Cross-region model inference requests per minute for Amazon Nova Micro", 400),
+    _quota("Cross-region model inference tokens per minute for Amazon Nova Micro", 8_000_000),
     _quota("Cross-region model inference requests per minute for Amazon Nova Lite", 400),
+    _quota("Cross-region model inference tokens per minute for Amazon Nova Lite", 4_000_000),
     _quota("Cross-region model inference requests per minute for Amazon Nova Pro", 50),
+    _quota("Cross-region model inference tokens per minute for Amazon Nova Pro", 400_000),
     _quota("Cross-region model inference requests per minute for Meta Llama 3.3 70B Instruct", 80),
+    _quota("Cross-region model inference tokens per minute for Meta Llama 3.3 70B Instruct", 300_000),
     _quota("On-demand model inference requests per minute for Qwen3 32B V1", 1000),
+    _quota("On-demand model inference tokens per minute for Qwen3 32B V1", 500_000),
 ]
 
 
@@ -76,7 +81,7 @@ class SyncModelQuotasScriptTests(unittest.TestCase):
         response = self.dynamo_client.scan(TableName=TABLE_NAME)
         self.assertEqual(response["Items"], [])
 
-    def test_apply_writes_every_mapped_models_rpm_limit(self):
+    def test_apply_writes_every_mapped_models_rpm_and_tpm_limit(self):
         sq_client = FakeServiceQuotasClient(_FULL_QUOTA_SET)
 
         synced, skipped = sync_script.sync_quotas(
@@ -87,16 +92,46 @@ class SyncModelQuotasScriptTests(unittest.TestCase):
         self.assertEqual(skipped, [])
 
         item = self.dynamo_client.get_item(
+            TableName=TABLE_NAME, Key={"pk": {"S": "quota#us.amazon.nova-micro-v1:0"}}
+        )["Item"]
+        self.assertEqual(item["rpm_limit"]["N"], "400")
+        self.assertEqual(item["tpm_limit"]["N"], "8000000")
+        self.assertEqual(item["quota_type"]["S"], "cross_region")
+
+        item = self.dynamo_client.get_item(
             TableName=TABLE_NAME, Key={"pk": {"S": "quota#us.amazon.nova-pro-v1:0"}}
         )["Item"]
         self.assertEqual(item["rpm_limit"]["N"], "50")
+        self.assertEqual(item["tpm_limit"]["N"], "400000")
         self.assertEqual(item["quota_type"]["S"], "cross_region")
 
         item = self.dynamo_client.get_item(
             TableName=TABLE_NAME, Key={"pk": {"S": "quota#qwen.qwen3-32b-v1:0"}}
         )["Item"]
         self.assertEqual(item["rpm_limit"]["N"], "1000")
+        self.assertEqual(item["tpm_limit"]["N"], "500000")
         self.assertEqual(item["quota_type"]["S"], "on_demand")
+
+    def test_missing_tpm_quota_still_syncs_rpm_only_not_skipped(self):
+        """RPM is required to sync at all; TPM is best-effort on top --
+        a model with a real RPM quota but no discoverable TPM quota
+        still syncs (RPM-only), it isn't treated the same as a fully
+        missing/unmapped model."""
+        partial = [q for q in _FULL_QUOTA_SET if q["QuotaName"] != "Cross-region model inference tokens per minute for Amazon Nova Pro"]
+        sq_client = FakeServiceQuotasClient(partial)
+
+        synced, skipped = sync_script.sync_quotas(
+            sq_client=sq_client, dynamo_client=self.dynamo_client, table_name=TABLE_NAME, apply=True,
+        )
+
+        self.assertIn("us.amazon.nova-pro-v1:0", synced)
+        self.assertEqual(skipped, [])
+
+        item = self.dynamo_client.get_item(
+            TableName=TABLE_NAME, Key={"pk": {"S": "quota#us.amazon.nova-pro-v1:0"}}
+        )["Item"]
+        self.assertEqual(item["rpm_limit"]["N"], "50")
+        self.assertNotIn("tpm_limit", item)
 
     def test_missing_quota_in_account_is_skipped_not_a_hard_failure(self):
         # Only 4 of the 5 mapped quotas are "present in this account".

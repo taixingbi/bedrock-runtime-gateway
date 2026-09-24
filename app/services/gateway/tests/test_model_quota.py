@@ -26,15 +26,15 @@ def _create_table(client) -> None:
     )
 
 
-def _put_quota(client, model_id: str, rpm_limit: int) -> None:
-    client.put_item(
-        TableName=TABLE_NAME,
-        Item={
-            "pk": {"S": f"quota#{model_id}"},
-            "rpm_limit": {"N": str(rpm_limit)},
-            "quota_type": {"S": "cross_region"},
-        },
-    )
+def _put_quota(client, model_id: str, rpm_limit: int, tpm_limit=None) -> None:
+    item = {
+        "pk": {"S": f"quota#{model_id}"},
+        "rpm_limit": {"N": str(rpm_limit)},
+        "quota_type": {"S": "cross_region"},
+    }
+    if tpm_limit is not None:
+        item["tpm_limit"] = {"N": str(tpm_limit)}
+    client.put_item(TableName=TABLE_NAME, Item=item)
 
 
 class FakeClock:
@@ -99,6 +99,42 @@ class ModelQuotaCacheTests(unittest.TestCase):
 
         self.assertEqual(cache.rpm_limit_for("model-a"), 50)
         self.assertEqual(cache.rpm_limit_for("model-b"), 1000)
+
+    def test_unknown_model_tpm_limit_is_none(self):
+        cache = ModelQuotaCache(table_name=TABLE_NAME, region=REGION, client=self._client, clock=self.clock)
+        self.assertIsNone(cache.tpm_limit_for("no-such-model"))
+
+    def test_synced_model_returns_its_tpm_limit(self):
+        _put_quota(self._client, "model-a", 50, tpm_limit=8_000_000)
+        cache = ModelQuotaCache(table_name=TABLE_NAME, region=REGION, client=self._client, clock=self.clock)
+
+        self.assertEqual(cache.tpm_limit_for("model-a"), 8_000_000)
+
+    def test_rpm_only_sync_leaves_tpm_limit_none(self):
+        """A model synced before TPM support existed, or one AWS has
+        no discoverable TPM quota for -- see sync script's own 'RPM
+        required, TPM best-effort' docstring."""
+        _put_quota(self._client, "model-a", 50)  # no tpm_limit
+        cache = ModelQuotaCache(table_name=TABLE_NAME, region=REGION, client=self._client, clock=self.clock)
+
+        self.assertEqual(cache.rpm_limit_for("model-a"), 50)
+        self.assertIsNone(cache.tpm_limit_for("model-a"))
+
+    def test_tpm_limit_reads_are_cached_together_with_rpm(self):
+        """rpm_limit_for and tpm_limit_for share the same cached row --
+        a re-sync mid-TTL must not be observed by either accessor,
+        proving there's no separate, independently-refreshing cache
+        entry for tpm_limit_for that could drift from rpm_limit_for's."""
+        _put_quota(self._client, "model-a", 50, tpm_limit=1_000_000)
+        cache = ModelQuotaCache(table_name=TABLE_NAME, region=REGION, client=self._client, clock=self.clock, ttl_s=60.0)
+        self.assertEqual(cache.rpm_limit_for("model-a"), 50)
+        self.assertEqual(cache.tpm_limit_for("model-a"), 1_000_000)
+
+        _put_quota(self._client, "model-a", 999, tpm_limit=9_999_999)
+        self.clock.advance(30.0)  # still within TTL
+
+        self.assertEqual(cache.rpm_limit_for("model-a"), 50)
+        self.assertEqual(cache.tpm_limit_for("model-a"), 1_000_000)
 
 
 @mock_aws
@@ -236,6 +272,103 @@ class ModelQuotaLimiterFairShareTests(unittest.TestCase):
         limiter = self._limiter(per_tenant_share_pct=0.1)  # 1 * 0.1 = 0.1 -> floors to 0 without the max(1, ...)
 
         self.assertTrue(limiter.allow("model-a", "acme"))
+
+
+@mock_aws
+class ModelQuotaLimiterTpmTests(unittest.TestCase):
+    """TPM enforcement -- additive to the RPM gate covered above, see
+    model_quota.py's own docstring on why both are checked
+    independently rather than TPM replacing RPM."""
+
+    def setUp(self):
+        self._client = boto3.client("dynamodb", region_name=REGION)
+        _create_table(self._client)
+        self.clock = FakeClock()
+
+    def _limiter(self, *, with_tenant_tpm: bool = False, per_tenant_share_pct: float = 0.4) -> ModelQuotaLimiter:
+        return ModelQuotaLimiter(
+            cache=ModelQuotaCache(table_name=TABLE_NAME, region=REGION, client=self._client, clock=self.clock),
+            limiter=DynamoDbRateLimiter(
+                table_name=TABLE_NAME, region=REGION, client=self._client, clock=self.clock,
+                key_prefix="ratelimit#model#",
+            ),
+            tpm_limiter=DynamoDbRateLimiter(
+                table_name=TABLE_NAME, region=REGION, client=self._client, clock=self.clock,
+                key_prefix="ratelimit#model_tpm#",
+            ),
+            tenant_tpm_limiter=(
+                DynamoDbRateLimiter(
+                    table_name=TABLE_NAME, region=REGION, client=self._client, clock=self.clock,
+                    key_prefix="ratelimit#model_tenant_tpm#",
+                )
+                if with_tenant_tpm else None
+            ),
+            per_tenant_share_pct=per_tenant_share_pct,
+        )
+
+    def test_no_estimated_tokens_skips_the_tpm_gate_entirely(self):
+        """Backward compatible: a caller that never passes
+        estimated_tokens (e.g. an older call site) is gated on RPM
+        only, exactly as if no tpm_limiter were configured at all."""
+        _put_quota(self._client, "model-a", 10, tpm_limit=5)  # tiny tpm budget
+        limiter = self._limiter()
+
+        for _ in range(10):
+            self.assertTrue(limiter.allow("model-a"))  # no estimated_tokens -- tpm never checked
+
+    def test_no_tpm_limiter_configured_skips_the_tpm_gate(self):
+        _put_quota(self._client, "model-a", 10, tpm_limit=5)
+        limiter = ModelQuotaLimiter(
+            cache=ModelQuotaCache(table_name=TABLE_NAME, region=REGION, client=self._client, clock=self.clock),
+            limiter=DynamoDbRateLimiter(
+                table_name=TABLE_NAME, region=REGION, client=self._client, clock=self.clock,
+                key_prefix="ratelimit#model#",
+            ),
+        )
+
+        self.assertTrue(limiter.allow("model-a", estimated_tokens=1000))  # would blow a tpm_limit=5 budget
+
+    def test_unsynced_tpm_limit_skips_the_tpm_gate_even_with_estimated_tokens(self):
+        """RPM-only sync (see sync script's own docstring) -- no
+        tpm_limit on the row at all means unknown, not zero."""
+        _put_quota(self._client, "model-a", 10)  # no tpm_limit
+        limiter = self._limiter()
+
+        for _ in range(10):
+            self.assertTrue(limiter.allow("model-a", estimated_tokens=1_000_000))
+
+    def test_synced_tpm_limit_is_enforced(self):
+        _put_quota(self._client, "model-a", 1000, tpm_limit=100)  # generous rpm, tiny tpm
+        limiter = self._limiter()
+
+        self.assertTrue(limiter.allow("model-a", estimated_tokens=60))
+        self.assertFalse(limiter.allow("model-a", estimated_tokens=60))  # 120 > 100 budget
+
+    def test_tpm_and_rpm_budgets_are_independent(self):
+        _put_quota(self._client, "model-a", 1, tpm_limit=1_000_000)  # rpm=1, generous tpm
+        limiter = self._limiter()
+
+        self.assertTrue(limiter.allow("model-a", estimated_tokens=10))
+        # RPM budget (1) is now exhausted even though TPM has plenty left.
+        self.assertFalse(limiter.allow("model-a", estimated_tokens=10))
+
+    def test_per_tenant_tpm_fair_share_caps_a_single_tenant(self):
+        _put_quota(self._client, "model-a", 1000, tpm_limit=100)  # per-tenant tpm share: 100*0.4=40
+        limiter = self._limiter(with_tenant_tpm=True, per_tenant_share_pct=0.4)
+
+        self.assertTrue(limiter.allow("model-a", "busy-tenant", estimated_tokens=40))
+        # This tenant's own 40-token share is exhausted, even though
+        # the model-wide 100-token tpm budget still has 60 left.
+        self.assertFalse(limiter.allow("model-a", "busy-tenant", estimated_tokens=1))
+
+    def test_a_different_tenant_is_unaffected_by_one_tenants_exhausted_tpm_share(self):
+        _put_quota(self._client, "model-a", 1000, tpm_limit=100)
+        limiter = self._limiter(with_tenant_tpm=True, per_tenant_share_pct=0.4)
+
+        self.assertTrue(limiter.allow("model-a", "busy-tenant", estimated_tokens=40))
+        self.assertFalse(limiter.allow("model-a", "busy-tenant", estimated_tokens=1))
+
+        self.assertTrue(limiter.allow("model-a", "quiet-tenant", estimated_tokens=40))
 
 
 if __name__ == "__main__":

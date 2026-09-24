@@ -2,12 +2,7 @@ import asyncio
 import time
 import unittest
 
-from ..concurrency import (
-    BlockingCallRunner,
-    BlockingCallTimeoutError,
-    ConcurrencyLimiter,
-    try_acquire_with_wait,
-)
+from ..concurrency import BlockingCallRunner, BlockingCallTimeoutError, ConcurrencyLimiter
 
 
 class ConcurrencyLimiterTests(unittest.TestCase):
@@ -69,70 +64,6 @@ class ConcurrencyLimiterTests(unittest.TestCase):
         token = limiter.try_acquire("acme")
         limiter.release("acme", token)
         self.assertTrue(limiter.try_acquire("acme"))
-
-
-class TryAcquireWithWaitTests(unittest.IsolatedAsyncioTestCase):
-    """`try_acquire_with_wait` is the 'Queue' state (TenantPolicy.
-    queue_enabled) -- these drive it entirely through its injectable
-    `clock`/`sleep` params so the tests run instantly, with no real
-    asyncio.sleep/wall-clock waiting."""
-
-    async def test_returns_lease_immediately_when_a_slot_is_free(self):
-        limiter = ConcurrencyLimiter(global_max=10, default_tenant_max=5)
-        lease = await try_acquire_with_wait(limiter, "acme", tenant_max=None, max_wait_s=5.0)
-        self.assertIsInstance(lease, str)
-
-    async def test_retries_until_a_slot_frees_and_returns_the_new_lease(self):
-        class FlakyLimiter:
-            def __init__(self):
-                self.attempts = 0
-                self.tenant_maxes_seen = []
-
-            def try_acquire(self, tenant_id, *, tenant_max=None):
-                self.attempts += 1
-                self.tenant_maxes_seen.append(tenant_max)
-                return None if self.attempts < 3 else "lease-3"
-
-        clock_state = {"t": 0.0}
-        sleep_calls = []
-
-        async def fake_sleep(seconds):
-            sleep_calls.append(seconds)
-            clock_state["t"] += seconds
-
-        limiter = FlakyLimiter()
-        lease = await try_acquire_with_wait(
-            limiter, "acme", tenant_max=7, max_wait_s=5.0, poll_interval_s=0.1,
-            clock=lambda: clock_state["t"], sleep=fake_sleep,
-        )
-        self.assertEqual(lease, "lease-3")
-        self.assertEqual(limiter.attempts, 3)
-        self.assertEqual(sleep_calls, [0.1, 0.1])
-        # tenant_max must be forwarded through on every retry, not just
-        # the first attempt.
-        self.assertEqual(limiter.tenant_maxes_seen, [7, 7, 7])
-
-    async def test_gives_up_and_returns_none_once_max_wait_elapses(self):
-        class NeverAdmits:
-            def try_acquire(self, tenant_id, *, tenant_max=None):
-                return None
-
-        clock_state = {"t": 0.0}
-        sleep_calls = []
-
-        async def fake_sleep(seconds):
-            sleep_calls.append(seconds)
-            clock_state["t"] += seconds
-
-        lease = await try_acquire_with_wait(
-            NeverAdmits(), "acme", tenant_max=None, max_wait_s=0.25, poll_interval_s=0.1,
-            clock=lambda: clock_state["t"], sleep=fake_sleep,
-        )
-        self.assertIsNone(lease)
-        # Never actually slept in real time -- the fake clock advanced
-        # past the deadline purely from the injected sleep's own
-        # bookkeeping, proving this test didn't take 0.25s of wall time.
-        self.assertGreaterEqual(clock_state["t"], 0.25)
 
 
 class BlockingCallRunnerTests(unittest.IsolatedAsyncioTestCase):

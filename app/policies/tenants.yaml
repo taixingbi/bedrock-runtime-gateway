@@ -7,66 +7,67 @@
 # gateway has a working S3/DynamoDB-backed PolicyStore, this
 # directory and the COPY step in Dockerfile go away entirely.
 # ============================================================
-# Tenant policy config (M2). Stands in for the DynamoDB-backed control
-# plane in plan section 8 -- see services/gateway/policy/store.py.
+# Dev tenant policies are managed in DynamoDB: gateway-tenant-policies-dev.
+# The three policies below were verified against DynamoDB on 2026-09-23.
+# Keep the file fallback empty so deleting a database policy cannot revive
+# an older policy from the image. DynamoDB-backed deployments continue to
+# load these tenants through LayeredPolicyStore.
 #
-# Loaded once at startup by FilePolicyStore. To change a tenant's state
-# at runtime without restarting the gateway, use the admin API instead of
-# editing this file:
+# Local/file-only use: replace "tenants: {}" with the uncommented example
+# block below. Do not add a second tenants key. These examples are a
+# reference snapshot, not automatically synchronized with live updates.
+# The YAML-to-DynamoDB migration script has no active tenants to import
+# from this file unless examples are deliberately enabled.
+
+tenants: {}
+
+# Commented examples (inactive):
+# tenants:
+#   # Renamed 2026-09-23 from "finance" (settings unchanged) -- team-a/
+#   # tenant-a/tenant-b removed entirely in the same change, see git log
+#   # for the prior tenant list.
+#   tenant1-finance:
+#     state: ACTIVE
+#     models:
+#       - us.amazon.nova-micro-v1:0
+#       # Must a superset of finance-chat-v1's fallbacks (route_sets.yaml)
+#       # -- validate.py enforces this so an automatic failover can never
+#       # hand a tenant a model they never explicitly allowed.
+#       - us.amazon.nova-lite-v1:0
+#       - us.meta.llama3-3-70b-instruct-v1:0
+#       - qwen.qwen3-32b-v1:0
+#       - us.amazon.nova-pro-v1:0
+#     rpm_limit: 300
+#     guardrail_policy: finance-v1
+#     route_set: finance-chat-v1
+#     slo:
+#       p95_latency_ms: 3000
+#     policy_epoch: 1
+#     monthly_budget: 10000 # M8 FinOps hard limit, USD/month
 #
-#   PUT /v1/admin/tenants/{tenant_id}/state   {"state": "SUSPENDED"}
+#   # Renamed 2026-09-23 from "search" (settings unchanged).
+#   tenant2-search:
+#     state: ACTIVE
+#     models:
+#       - us.amazon.nova-micro-v1:0
+#       # Must be a superset of search-chat-v1's fallbacks (route_sets.yaml)
+#       # -- validate.py enforces this so an automatic failover can never
+#       # hand a tenant a model they never explicitly allowed.
+#       - us.amazon.nova-lite-v1:0
+#       - us.meta.llama3-3-70b-instruct-v1:0
+#       - qwen.qwen3-32b-v1:0
+#       - us.amazon.nova-pro-v1:0
+#     rpm_limit: 120
+#     guardrail_policy: standard-v1
+#     route_set: search-chat-v1
+#     slo:
+#       p95_latency_ms: 5000
+#     policy_epoch: 1
 #
-# (requires a token with the ADMIN_REQUIRED_ROLE role, default
-# platform_admin) -- that takes effect immediately via push invalidation,
-# whereas a file edit only takes effect on the next process restart.
-
-tenants:
-  # Renamed 2026-09-23 from "finance" (settings unchanged) -- team-a/
-  # tenant-a/tenant-b removed entirely in the same change, see git log
-  # for the prior tenant list.
-  tenant1-finance:
-    state: ACTIVE
-    models:
-      - us.amazon.nova-micro-v1:0
-      # Must a superset of finance-chat-v1's fallbacks (route_sets.yaml)
-      # -- validate.py enforces this so an automatic failover can never
-      # hand a tenant a model they never explicitly allowed.
-      - us.amazon.nova-lite-v1:0
-      - us.meta.llama3-3-70b-instruct-v1:0
-      - qwen.qwen3-32b-v1:0
-      - us.amazon.nova-pro-v1:0
-    rpm_limit: 300
-    guardrail_policy: finance-v1
-    route_set: finance-chat-v1
-    slo:
-      p95_latency_ms: 3000
-    policy_epoch: 1
-    monthly_budget: 10000 # M8 FinOps hard limit, USD/month
-    queue_enabled: true # 2026-09-23: wait up to queue_max_wait_s (default 5s) for a freed concurrency slot instead of an immediate 429
-
-  # Renamed 2026-09-23 from "search" (settings unchanged).
-  tenant2-search:
-    state: ACTIVE
-    models:
-      - us.amazon.nova-micro-v1:0
-      # Must be a superset of search-chat-v1's fallbacks (route_sets.yaml)
-      # -- validate.py enforces this so an automatic failover can never
-      # hand a tenant a model they never explicitly allowed.
-      - us.amazon.nova-lite-v1:0
-      - us.meta.llama3-3-70b-instruct-v1:0
-      - qwen.qwen3-32b-v1:0
-      - us.amazon.nova-pro-v1:0
-    rpm_limit: 120
-    guardrail_policy: standard-v1
-    route_set: search-chat-v1
-    slo:
-      p95_latency_ms: 5000
-    policy_epoch: 1
-
-  # Renamed 2026-09-23 from "sandbox" (settings unchanged).
-  tenant0-sandbox:
-    state: ACTIVE
-    models: []   # no restriction beyond the gateway default model
-    rpm_limit: 30
-    guardrail_policy: standard-v1
-    policy_epoch: 1
+#   # Renamed 2026-09-23 from "sandbox" (settings unchanged).
+#   tenant0-sandbox:
+#     state: ACTIVE
+#     models: []   # no restriction beyond the gateway default model
+#     rpm_limit: 30
+#     guardrail_policy: standard-v1
+#     policy_epoch: 1

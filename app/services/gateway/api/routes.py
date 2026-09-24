@@ -93,17 +93,21 @@ def build_router(
     async def _run_blocking_limited(tenant_policy, func, *args, **kwargs):
         # Acquire and release inside the executor operation. HTTP cancellation
         # cannot free capacity while the SDK call continues in that thread.
+        #
+        # Fast-reject only, no in-request wait for a freed slot: an earlier
+        # version of this polled (queue_enabled/queue_max_wait_s) instead of
+        # rejecting immediately, deliberately reverted -- blocking the
+        # server-side connection during overload is the wrong direction
+        # (it holds the ALB target/connection exactly when you want to free
+        # it fastest), and a caller that wants its request to survive
+        # momentary saturation should use the durable /v1/jobs SQS path
+        # (M7), not an ad hoc in-process wait with none of SQS's durability.
         def execute():
-            deadline = time.monotonic() + (tenant_policy.queue_max_wait_s if tenant_policy.queue_enabled else 0)
-            while True:
-                token = concurrency_limiter.try_acquire(
-                    tenant_policy.tenant_id, tenant_max=tenant_policy.max_concurrency,
-                )
-                if token:
-                    break
-                if time.monotonic() >= deadline:
-                    raise pipeline.PipelineError(429, "CONCURRENCY_LIMIT_EXCEEDED", "inference capacity exhausted")
-                time.sleep(0.1)
+            token = concurrency_limiter.try_acquire(
+                tenant_policy.tenant_id, tenant_max=tenant_policy.max_concurrency,
+            )
+            if not token:
+                raise pipeline.PipelineError(429, "CONCURRENCY_LIMIT_EXCEEDED", "inference capacity exhausted")
             with maintained_lease(concurrency_limiter, tenant_policy.tenant_id, token):
                 return func(*args, **kwargs)
         try:

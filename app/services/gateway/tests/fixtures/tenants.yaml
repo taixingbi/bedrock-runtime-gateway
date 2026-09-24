@@ -15,7 +15,6 @@ tenants:
       p95_latency_ms: 3000
     policy_epoch: 1
     monthly_budget: 10000
-    queue_enabled: true
   tenant2-search:
     state: ACTIVE
     models:

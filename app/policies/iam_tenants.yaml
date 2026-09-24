@@ -28,40 +28,51 @@
 # execute-api:Invoke on the /iam/* route, see infra/README.md) before
 # a new caller can use this path.
 
-iam_principals:
-  # Manual curl/smoke testing against the tenant1-finance tenant
-  # (dev only) -- has a real monthly_budget (tenants.yaml), so this is
-  # the entry to use to see an actual model response rather than an
-  # immediate BUDGET_EXCEEDED. Assumed via `aws sts assume-role` from
-  # the taixingbi user (see the role's trust policy).
-  #
-  # Renamed 2026-09-23: tenant_id finance -> tenant1-finance (rest of
-  # this file's team-a/tenant-a/tenant-b entries removed entirely in
-  # the same change -- see git log for the prior mappings, including
-  # the taixingbi user's own former team-a mapping, deliberately not
-  # replaced).
-  "arn:aws:iam::646821141010:role/finance-manual-smoke-test":
-    tenant_id: tenant1-finance
-    application_id: finance-manual-smoke-test
-    roles: [developer, operator]
-
-  "arn:aws:sts::646821141010:assumed-role/finance-manual-smoke-test/*":
-    tenant_id: tenant1-finance
-    application_id: finance-manual-smoke-test
-    roles: [developer, operator]
-
-  # Manual curl/smoke testing of plan section 30's ABAC retrofit --
-  # tenant_id: tenant1-finance + roles: [manager] should be able to
-  # see/change this tenant's own admin data (GET /v1/admin/usage,
-  # /v1/admin/tenants, PUT /v1/admin/tenants/tenant1-finance/state) but
-  # get 403 acting on any other tenant, unlike finance-manual-smoke-test
-  # above (developer only, can't reach /v1/admin/* at all).
-  "arn:aws:iam::646821141010:role/finance-manager-smoke-test":
-    tenant_id: tenant1-finance
-    application_id: finance-manager-smoke-test
-    roles: [manager]
-
-  "arn:aws:sts::646821141010:assumed-role/finance-manager-smoke-test/*":
-    tenant_id: tenant1-finance
-    application_id: finance-manager-smoke-test
-    roles: [manager]
+iam_principals: {}
+# Emptied 2026-09-23: all 4 entries previously here (finance-manual-
+# smoke-test and finance-manager-smoke-test, each as an exact role ARN
+# and an assumed-role wildcard, all tenant_id: tenant1-finance) are
+# confirmed already present in DynamoDB
+# (gateway-principal-grants-dev), which LayeredIamTenantResolver checks
+# first -- this file's copies had been dead weight, not a second
+# source of truth, for some already-elapsed window before this cleanup
+# (the exact cutover point isn't known; the mappings were found already
+# migrated, not migrated by this change). See
+# app/scripts/migrate_file_tenants_to_dynamodb.py's sibling tenant-
+# policy migration for the same file-to-DynamoDB pattern -- no
+# equivalent script exists for IAM principals since these were already
+# fully migrated when this was checked.
+#
+# Add an entry back here (not just in DynamoDB) if you want it git-
+# reviewed and/or need it to work in an environment with no live
+# DynamoDB table yet (prod today).
+#
+# Examples only -- commented out; these do not grant access.
+# To enable file-based mappings, replace "iam_principals: {}" above with
+# the uncommented example block below (do not add a second root key).
+# Keep the block commented while DynamoDB manages these grants.
+#
+# iam_principals:
+#   # Application caller: exact IAM role ARN.
+#   "arn:aws:iam::646821141010:role/finance-manual-smoke-test":
+#     tenant_id: tenant1-finance
+#     application_id: finance-manual-smoke-test
+#     roles: [developer, operator]
+#
+#   # Same role assumed through STS; matches any session-name suffix
+#   # in FileIamTenantResolver.
+#   "arn:aws:sts::646821141010:assumed-role/finance-manual-smoke-test/*":
+#     tenant_id: tenant1-finance
+#     application_id: finance-manual-smoke-test
+#     roles: [developer, operator]
+#
+#   # Tenant manager: permissions must be enforced by the consuming API.
+#   "arn:aws:iam::646821141010:role/finance-manager-smoke-test":
+#     tenant_id: tenant1-finance
+#     application_id: finance-manager-smoke-test
+#     roles: [manager]
+#
+#   "arn:aws:sts::646821141010:assumed-role/finance-manager-smoke-test/*":
+#     tenant_id: tenant1-finance
+#     application_id: finance-manager-smoke-test
+#     roles: [manager]

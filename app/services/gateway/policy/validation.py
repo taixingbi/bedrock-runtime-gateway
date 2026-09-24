@@ -29,7 +29,6 @@ _KNOWN_FIELDS = frozenset({
     "debug_capture_retention_days", "max_concurrency", "monthly_budget",
     "data_classification", "daily_budget", "application_budgets",
     "monthly_budget_soft_threshold_pct", "priority_class",
-    "queue_enabled", "queue_max_wait_s",
 })
 
 _KNOWN_PRIORITY_CLASSES = frozenset({"critical", "standard", "best_effort"})
@@ -136,15 +135,6 @@ def validate_policy_changes(changes: Dict[str, Any]) -> None:
         value = changes["priority_class"]
         if not isinstance(value, str) or value not in _KNOWN_PRIORITY_CLASSES:
             raise PolicyValidationError(f"'priority_class' must be one of {sorted(_KNOWN_PRIORITY_CLASSES)}")
-
-    if "queue_enabled" in changes:
-        if not isinstance(changes["queue_enabled"], bool):
-            raise PolicyValidationError("'queue_enabled' must be a boolean")
-
-    if "queue_max_wait_s" in changes:
-        value = changes["queue_max_wait_s"]
-        if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
-            raise PolicyValidationError("'queue_max_wait_s' must be a positive number")
 
     if "slo" in changes:
         slo = changes["slo"]

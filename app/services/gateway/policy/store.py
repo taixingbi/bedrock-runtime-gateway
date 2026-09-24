@@ -213,8 +213,6 @@ def load_policies_from_yaml(path: str) -> InMemoryPolicyStore:
                 else None
             ),
             priority_class=cfg.get("priority_class", "standard"),
-            queue_enabled=bool(cfg.get("queue_enabled", False)),
-            queue_max_wait_s=float(cfg.get("queue_max_wait_s", 5.0)),
         )
     return InMemoryPolicyStore(policies)
 
@@ -269,10 +267,6 @@ def _policy_to_item(policy: TenantPolicy) -> Dict[str, Any]:
         item["monthly_budget_soft_threshold_pct"] = Decimal(str(policy.monthly_budget_soft_threshold_pct))
     if policy.priority_class != "standard":
         item["priority_class"] = policy.priority_class
-    if policy.queue_enabled:
-        item["queue_enabled"] = policy.queue_enabled
-    if policy.queue_max_wait_s != 5.0:
-        item["queue_max_wait_s"] = Decimal(str(policy.queue_max_wait_s))
     return item
 
 
@@ -306,10 +300,6 @@ def _item_to_policy(item: Dict[str, Any]) -> TenantPolicy:
             else None
         ),
         priority_class=item.get("priority_class", "standard"),
-        queue_enabled=bool(item.get("queue_enabled", False)),
-        queue_max_wait_s=(
-            float(item["queue_max_wait_s"]) if "queue_max_wait_s" in item else 5.0
-        ),
     )
 
 

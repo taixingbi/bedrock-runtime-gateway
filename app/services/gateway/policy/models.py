@@ -63,17 +63,6 @@ class TenantPolicy:
     # Settings.concurrency_default_tenant_max applies (see
     # concurrency.py, pipeline.enforce_concurrency_limit).
     max_concurrency: Optional[int] = None
-    # Plan section 16's concurrency fix, queueing follow-up: when the
-    # concurrency slot check (above) fails, False (default) means the
-    # existing fast-reject behavior -- 429 immediately. True means
-    # api/routes.py's _run_blocking_limited instead polls for a slot to
-    # free up for up to queue_max_wait_s before giving up and 429ing --
-    # a bounded wait on the same synchronous request/connection, not a
-    # real message queue (that's the separate, client-chosen /v1/jobs
-    # SQS path, M7). Named to match this platform's own admission-
-    # control vocabulary (Admit / Queue / Reject), not a new concept.
-    queue_enabled: bool = False
-    queue_max_wait_s: float = 5.0
     # M8: hard limit on estimated spend per calendar month (see
     # usage/store.py). None means unlimited -- most tenants don't need
     # one for a V1 MVP; budget enforcement is opt-in per tenant.

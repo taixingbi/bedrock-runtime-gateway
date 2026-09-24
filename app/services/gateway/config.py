@@ -126,6 +126,13 @@ class Settings:
     # fast-rejected at the limiter.
     concurrency_global_max: int
     concurrency_default_tenant_max: int
+    # Reserved-headroom priority enforcement (TenantPolicy.priority_class):
+    # a "best_effort" request is additionally capped at this fraction of
+    # concurrency_global_max, guaranteeing the rest is always obtainable
+    # by "critical"/"standard" traffic regardless of how busy a
+    # best_effort tenant is -- see concurrency.py's ConcurrencyLimiter/
+    # DynamoDbConcurrencyLimiter for the actual mechanism.
+    concurrency_best_effort_max_pct: float
     blocking_call_thread_pool_size: int
     # Bounds how long a request waits for a blocking call, not how long
     # the call's own thread keeps running (Python threads can't be
@@ -151,6 +158,12 @@ class Settings:
     # "purely ephemeral counters" shape admission_control_table_name's
     # rows do.
     model_quotas_table_name: str
+    # routing/model_quota.py's per-tenant fair-share sub-cap: a single
+    # tenant may never consume more than this fraction of a shared
+    # model's own rpm_limit, on top of (not instead of) the overall
+    # model-wide gate -- see that module's own docstring for the
+    # ordering/tradeoff this implies.
+    model_quota_per_tenant_share_pct: float
     # Plan section 35.18 -- how long DynamoDbConcurrencyLimiter's
     # per-request lease items live before reconcile() treats them as
     # abandoned (a crashed process, not a slow call) and compensates
@@ -265,10 +278,12 @@ def load_settings() -> Settings:
         bedrock_guardrail_version=os.environ.get("BEDROCK_GUARDRAIL_VERSION", "DRAFT"),
         concurrency_global_max=_env_int("CONCURRENCY_GLOBAL_MAX", 32),
         concurrency_default_tenant_max=_env_int("CONCURRENCY_DEFAULT_TENANT_MAX", 8),
+        concurrency_best_effort_max_pct=_env_float("CONCURRENCY_BEST_EFFORT_MAX_PCT", 0.5),
         blocking_call_thread_pool_size=_env_int("BLOCKING_CALL_THREAD_POOL_SIZE", 32),
         blocking_call_timeout_s=_env_float("BLOCKING_CALL_TIMEOUT_S", 60.0),
         admission_control_table_name=os.environ.get("ADMISSION_CONTROL_TABLE_NAME", ""),
         model_quotas_table_name=os.environ.get("MODEL_QUOTAS_TABLE_NAME", ""),
+        model_quota_per_tenant_share_pct=_env_float("MODEL_QUOTA_PER_TENANT_SHARE_PCT", 0.4),
         concurrency_lease_ttl_s=_env_float("CONCURRENCY_LEASE_TTL_S", 300.0),
         jobs_queue_url=os.environ.get("JOBS_QUEUE_URL", ""),
         jobs_table_name=os.environ.get("JOBS_TABLE_NAME", ""),

@@ -46,6 +46,24 @@ same as "provably over quota", permanently skipping any model this
 was never wired up for. That would make an operational gap (forgot to
 run the sync script) silently worse than not having this feature at
 all.
+
+Per-tenant fair share (optional, `tenant_limiter`): the overall-model
+check above is a SHARED account-wide resource -- protecting Bedrock's
+own quota from the platform, not protecting any one tenant's fair
+share of it from a busy sibling. A third row per (model_id, tenant_id)
+pair, "ratelimit#model_tenant#<model_id>#<tenant_id>", caps any single
+tenant at `per_tenant_share_pct` of the model's own rpm_limit --
+checked AFTER the overall-model check (only once that passes), so a
+model that's already globally exhausted rejects before ever touching a
+tenant's own share budget. The reverse order-of-operations tradeoff is
+real and accepted: if the model-wide check passes but a tenant's own
+share is exhausted, that one overall-bucket token is "wasted" (already
+consumed, request still rejected) -- judged better than the
+alternative of charging a tenant's fairness budget for a request that
+was going to be globally rejected regardless. This is a heuristic
+fairness cap, not a guarantee under adversarial timing -- a busy
+tenant can still consume its full share before a quieter one gets a
+turn; it just can no longer consume the OTHER tenants' shares too.
 """
 from __future__ import annotations
 
@@ -101,12 +119,31 @@ class ModelQuotaCache:
 
 
 class ModelQuotaLimiter:
-    def __init__(self, *, cache: ModelQuotaCache, limiter: DynamoDbRateLimiter):
+    def __init__(
+        self,
+        *,
+        cache: ModelQuotaCache,
+        limiter: DynamoDbRateLimiter,
+        tenant_limiter: Optional[DynamoDbRateLimiter] = None,
+        per_tenant_share_pct: float = 0.4,
+    ):
         self._cache = cache
         self._limiter = limiter
+        # Optional: None (default) means no per-tenant fair-share gate
+        # at all -- every existing caller of allow(model_id) without a
+        # tenant_id behaves exactly as before this existed.
+        self._tenant_limiter = tenant_limiter
+        self._per_tenant_share_pct = per_tenant_share_pct
 
-    def allow(self, model_id: str) -> bool:
+    def allow(self, model_id: str, tenant_id: Optional[str] = None) -> bool:
         rpm_limit = self._cache.rpm_limit_for(model_id)
         if rpm_limit is None:
             return True  # fail open -- see module docstring
-        return self._limiter.allow(model_id, rpm_limit=rpm_limit)
+        if not self._limiter.allow(model_id, rpm_limit=rpm_limit):
+            return False
+        if tenant_id is not None and self._tenant_limiter is not None:
+            per_tenant_limit = max(1, int(rpm_limit * self._per_tenant_share_pct))
+            tenant_key = f"{model_id}#{tenant_id}"
+            if not self._tenant_limiter.allow(tenant_key, rpm_limit=per_tenant_limit):
+                return False
+        return True

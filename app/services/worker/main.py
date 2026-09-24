@@ -103,6 +103,11 @@ def main() -> None:
                 table_name=settings.model_quotas_table_name, region=settings.aws_region,
                 key_prefix="ratelimit#model#",
             ),
+            tenant_limiter=DynamoDbRateLimiter(
+                table_name=settings.model_quotas_table_name, region=settings.aws_region,
+                key_prefix="ratelimit#model_tenant#",
+            ),
+            per_tenant_share_pct=settings.model_quota_per_tenant_share_pct,
         )
         if settings.model_quotas_table_name
         else None

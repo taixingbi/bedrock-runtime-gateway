@@ -202,18 +202,45 @@ def enforce_rate_limit(policy: TenantPolicy, *, rate_limiter: TokenBucketRateLim
         )
 
 
+def enforce_token_rate_limit(
+    policy: TenantPolicy, *, rate_limiter: TokenBucketRateLimiter, estimated_tokens: int
+) -> None:
+    """Stage 4a: TPM (tokens-per-minute), separate from stage 4's
+    rpm_limit (request *rate*) -- see TenantPolicy.tpm_limit's own
+    docstring for why. None (default) means opted out, same as
+    monthly_budget.
+
+    Reuses the SAME rate_limiter instance/table enforce_rate_limit
+    does, via a differently-suffixed key (f"{tenant_id}:tpm") so the
+    RPM and TPM buckets never collide, and `amount=estimated_tokens`
+    instead of the implicit 1 RPM consumes -- see
+    policy/rate_limiter.py's `allow(..., amount=...)` param."""
+    if policy.tpm_limit is None:
+        return
+    if not rate_limiter.allow(f"{policy.tenant_id}:tpm", rpm_limit=policy.tpm_limit, amount=float(estimated_tokens)):
+        raise PipelineError(
+            429, "TOKEN_RATE_LIMIT_EXCEEDED",
+            f"tenant '{policy.tenant_id}' exceeded its tokens-per-minute limit",
+        )
+
+
 def enforce_concurrency_limit(policy: TenantPolicy, *, concurrency_limiter: ConcurrencyLimiter) -> None:
     """Stage 4c (plan section 16's concurrency fix): fast-reject, not
     queue-and-wait -- raises PipelineError(429) immediately if the
-    tenant's or the global slot budget is exhausted. Distinct from
-    enforce_rate_limit: rpm_limit bounds request *rate*, this bounds how
-    many blocking calls (guardrail checks, Bedrock inference) may be
-    in flight for this tenant/globally at once.
+    tenant's, the global, or (for a "best_effort" tenant) the reserved-
+    headroom slot budget is exhausted -- see TenantPolicy.priority_class's
+    own docstring. Distinct from enforce_rate_limit: rpm_limit bounds
+    request *rate*, this bounds how many blocking calls (guardrail
+    checks, Bedrock inference) may be in flight for this
+    tenant/globally at once.
 
     Callers MUST release the acquired slot (concurrency_limiter.release
-    (policy.tenant_id)) once the guarded call finishes, success or
-    failure, or it leaks permanently -- this function only acquires."""
-    if not concurrency_limiter.try_acquire(policy.tenant_id, tenant_max=policy.max_concurrency):
+    (policy.tenant_id, priority_class=policy.priority_class)) once the
+    guarded call finishes, success or failure, or it leaks permanently
+    -- this function only acquires."""
+    if not concurrency_limiter.try_acquire(
+        policy.tenant_id, tenant_max=policy.max_concurrency, priority_class=policy.priority_class,
+    ):
         raise PipelineError(
             429, "CONCURRENCY_LIMIT_EXCEEDED",
             f"tenant '{policy.tenant_id}' exceeded its concurrent-request limit, or the gateway is globally saturated",
@@ -299,7 +326,7 @@ class AdmissionDecision:
     from the first."""
 
     allowed: bool
-    stage: Optional[str] = None  # "kill_switch" | "rate_limit" | "budget", None if allowed
+    stage: Optional[str] = None  # "kill_switch" | "rate_limit" | "token_rate_limit" | "budget", None if allowed
     error: Optional[PipelineError] = None
     warning: Optional[str] = None  # enforce_budget's soft-threshold warning, if any
 
@@ -312,9 +339,13 @@ def admission_decision(
     month: str,
     day: Optional[str] = None,
     application_id: Optional[str] = None,
+    estimated_tokens: Optional[int] = None,
 ) -> AdmissionDecision:
-    """Stages 3-4b run together: kill-switch, rate limit, budget (see
-    module docstring's pipeline diagram). Concurrency (stage 4c) is
+    """Stages 3-4b run together: kill-switch, rate limit, TPM (only
+    when both `estimated_tokens` is supplied AND policy.tpm_limit is
+    set -- callers with no request body available yet, or who never
+    opt a tenant into tpm_limit, are unaffected), budget (see module
+    docstring's pipeline diagram). Concurrency (stage 4c) is
     deliberately NOT included here -- it's acquired per-blocking-call
     around the guardrail/inference calls themselves (api/routes.py's
     _run_blocking_limited), not upfront at admission time, since the
@@ -328,6 +359,12 @@ def admission_decision(
         enforce_rate_limit(policy, rate_limiter=rate_limiter)
     except PipelineError as exc:
         return AdmissionDecision(allowed=False, stage="rate_limit", error=exc)
+
+    if estimated_tokens is not None:
+        try:
+            enforce_token_rate_limit(policy, rate_limiter=rate_limiter, estimated_tokens=estimated_tokens)
+        except PipelineError as exc:
+            return AdmissionDecision(allowed=False, stage="token_rate_limit", error=exc)
 
     try:
         warning = enforce_budget(

@@ -221,6 +221,11 @@ def create_app(
                 table_name=settings.model_quotas_table_name, region=settings.aws_region,
                 key_prefix="ratelimit#model#",
             ),
+            tenant_limiter=DynamoDbRateLimiter(
+                table_name=settings.model_quotas_table_name, region=settings.aws_region,
+                key_prefix="ratelimit#model_tenant#",
+            ),
+            per_tenant_share_pct=settings.model_quota_per_tenant_share_pct,
         )
     router = CertifiedRouter(
         converse_client=converse_client,
@@ -277,6 +282,7 @@ def create_app(
         enterprise_group_resolver=enterprise_group_resolver,
         model_registry=model_registry,
         request_audit_store=request_audit_store,
+        model_quota_limiter=model_quota_limiter,
     )
     jobs_router = build_jobs_router(
         settings=settings,

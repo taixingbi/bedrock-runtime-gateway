@@ -102,6 +102,59 @@ class RateLimitTests(unittest.TestCase):
             pipeline.enforce_rate_limit(policy, rate_limiter=limiter)
 
 
+class TokenRateLimitTests(unittest.TestCase):
+    """TenantPolicy.tpm_limit -- separate from RateLimitTests above
+    (rpm_limit bounds request *rate*, not token volume)."""
+
+    def test_no_tpm_limit_configured_is_a_noop(self):
+        limiter = TokenBucketRateLimiter()
+        policy = _policy(tpm_limit=None)  # default
+        pipeline.enforce_token_rate_limit(policy, rate_limiter=limiter, estimated_tokens=1_000_000)  # no raise
+
+    def test_within_budget_allowed(self):
+        limiter = TokenBucketRateLimiter()
+        policy = _policy(tpm_limit=1000)
+        pipeline.enforce_token_rate_limit(policy, rate_limiter=limiter, estimated_tokens=500)  # no raise
+
+    def test_exceeding_budget_is_429(self):
+        limiter = TokenBucketRateLimiter()
+        policy = _policy(tenant_id="acme", tpm_limit=1000)
+
+        pipeline.enforce_token_rate_limit(policy, rate_limiter=limiter, estimated_tokens=900)
+        with self.assertRaises(pipeline.PipelineError) as ctx:
+            pipeline.enforce_token_rate_limit(policy, rate_limiter=limiter, estimated_tokens=200)
+
+        self.assertEqual(ctx.exception.status_code, 429)
+        self.assertEqual(ctx.exception.code, "TOKEN_RATE_LIMIT_EXCEEDED")
+
+    def test_separate_bucket_from_rpm_rate_limit(self):
+        """A tenant well within its RPM budget (few requests) can still
+        hit its TPM budget (large requests) -- the two must be
+        tracked independently, sharing the rate_limiter instance but
+        not the same bucket key."""
+        limiter = TokenBucketRateLimiter()
+        policy = _policy(tenant_id="acme", rpm_limit=1000, tpm_limit=1000)
+
+        pipeline.enforce_rate_limit(policy, rate_limiter=limiter)  # RPM: 1 of 1000, plenty left
+        pipeline.enforce_token_rate_limit(policy, rate_limiter=limiter, estimated_tokens=999)
+        with self.assertRaises(pipeline.PipelineError) as ctx:
+            pipeline.enforce_token_rate_limit(policy, rate_limiter=limiter, estimated_tokens=10)
+
+        self.assertEqual(ctx.exception.code, "TOKEN_RATE_LIMIT_EXCEEDED")
+        pipeline.enforce_rate_limit(policy, rate_limiter=limiter)  # RPM still has plenty of room
+
+    def test_tenants_are_isolated(self):
+        limiter = TokenBucketRateLimiter()
+        tenant_a = _policy(tenant_id="tenant-a", tpm_limit=100)
+        tenant_b = _policy(tenant_id="tenant-b", tpm_limit=100)
+
+        pipeline.enforce_token_rate_limit(tenant_a, rate_limiter=limiter, estimated_tokens=100)
+        with self.assertRaises(pipeline.PipelineError):
+            pipeline.enforce_token_rate_limit(tenant_a, rate_limiter=limiter, estimated_tokens=1)
+
+        pipeline.enforce_token_rate_limit(tenant_b, rate_limiter=limiter, estimated_tokens=100)  # unaffected
+
+
 class ModelAllowlistTests(unittest.TestCase):
     def test_empty_allowlist_permits_any_requested_model(self):
         policy = _policy(models=[])

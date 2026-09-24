@@ -40,6 +40,7 @@ from ..inference.bedrock_client import BedrockChatMessage, BedrockInvocationErro
 from ..policy.cache import PolicySnapshotCache
 from ..policy.rate_limiter import TokenBucketRateLimiter
 from ..routing.circuit_breaker import CircuitBreaker
+from ..routing.model_quota import ModelQuotaLimiter
 from ..routing.model_registry import ModelRegistryEntry
 from ..routing.router import AllRoutesUnavailableError, CertifiedRouter
 from ..streaming import stream_chat_response
@@ -50,6 +51,7 @@ from ..telemetry.otel import set_span_attributes
 from ..telemetry.request_audit import RequestAuditEvent, RequestAuditStore, current_trace_id
 from ..telemetry.slo import slo_breached
 from ..usage.store import UsageStore, record_provider_usage, current_day, current_month
+from ..usage.token_estimate import estimate_tokens
 from .errors import error_response as _error
 from .schemas import ChatRequest, ChatResponse, Usage
 
@@ -85,6 +87,7 @@ def build_router(
     enterprise_group_resolver: Optional[EnterpriseGroupResolver] = None,
     model_registry: Optional[Dict[str, ModelRegistryEntry]] = None,
     request_audit_store: Optional[RequestAuditStore] = None,
+    model_quota_limiter: Optional[ModelQuotaLimiter] = None,
 ) -> APIRouter:
     api_router = APIRouter()
 
@@ -105,10 +108,14 @@ def build_router(
         def execute():
             token = concurrency_limiter.try_acquire(
                 tenant_policy.tenant_id, tenant_max=tenant_policy.max_concurrency,
+                priority_class=tenant_policy.priority_class,
             )
             if not token:
                 raise pipeline.PipelineError(429, "CONCURRENCY_LIMIT_EXCEEDED", "inference capacity exhausted")
-            with maintained_lease(concurrency_limiter, tenant_policy.tenant_id, token):
+            with maintained_lease(
+                concurrency_limiter, tenant_policy.tenant_id, token,
+                priority_class=tenant_policy.priority_class,
+            ):
                 return func(*args, **kwargs)
         try:
             return await blocking_call_runner.run(execute)
@@ -219,13 +226,14 @@ def build_router(
                 )
                 return _error(exc.status_code, exc.code, str(exc), request_id)
 
-            # Plan section 34.6: kill-switch + rate-limit + budget as
-            # one reported decision instead of three separate calls --
+            # Plan section 34.6: kill-switch + rate-limit + TPM + budget
+            # as one reported decision instead of separate calls --
             # concurrency (stage 4c) is acquired later, per-blocking-
             # call, not here (see admission_decision's docstring).
             admission = pipeline.admission_decision(
                 policy, rate_limiter=rate_limiter, usage_store=usage_store,
                 month=current_month(), day=current_day(), application_id=identity.application_id,
+                estimated_tokens=estimate_tokens(chat_request.messages, chat_request.max_tokens),
             )
             if not admission.allowed:
                 exc = admission.error
@@ -354,14 +362,30 @@ def build_router(
                         f"model '{model_id}' is temporarily unavailable (circuit open)",
                         request_id,
                     )
+                # Streaming bypasses CertifiedRouter.converse() entirely
+                # (no fallback candidates here), so its own quota gate
+                # never runs unless checked explicitly -- same single-
+                # check treatment as circuit_breaker.allow() just above.
+                if model_quota_limiter is not None and not model_quota_limiter.allow(model_id, identity.tenant_id):
+                    set_span_attributes(span, status=503, error="over model quota")
+                    return _error(
+                        503, "UPSTREAM_UNAVAILABLE",
+                        f"model '{model_id}' is temporarily unavailable (over its AWS quota budget)",
+                        request_id,
+                    )
                 # Iterator construction and consumption happen off the event loop;
                 # the lease covers the entire upstream stream, including disconnect cleanup.
                 invocation_id = str(uuid.uuid4())
                 def stream_chunks():
-                    token = concurrency_limiter.try_acquire(identity.tenant_id, tenant_max=policy.max_concurrency)
+                    token = concurrency_limiter.try_acquire(
+                        identity.tenant_id, tenant_max=policy.max_concurrency,
+                        priority_class=policy.priority_class,
+                    )
                     if not token:
                         raise pipeline.PipelineError(429, "CONCURRENCY_LIMIT_EXCEEDED", "inference capacity exhausted")
-                    with maintained_lease(concurrency_limiter, identity.tenant_id, token):
+                    with maintained_lease(
+                        concurrency_limiter, identity.tenant_id, token, priority_class=policy.priority_class,
+                    ):
                         chunks = router_converse_stream(
                             router, model_id=model_id, messages=messages,
                             max_tokens=chat_request.max_tokens, temperature=chat_request.temperature,
@@ -482,6 +506,7 @@ def build_router(
                     messages=messages,
                     max_tokens=chat_request.max_tokens,
                     temperature=chat_request.temperature,
+                    tenant_id=identity.tenant_id,
                 )
             except BedrockInvocationError as exc:
                 status_code, error_code = _ERROR_STATUS_MAP.get(exc.code, _DEFAULT_ERROR_STATUS)

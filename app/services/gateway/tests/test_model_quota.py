@@ -143,5 +143,100 @@ class ModelQuotaLimiterTests(unittest.TestCase):
         self.assertTrue(limiter.allow("model-b"))  # unaffected by model-a's exhaustion
 
 
+@mock_aws
+class ModelQuotaLimiterFairShareTests(unittest.TestCase):
+    """The per-tenant fair-share sub-cap (tenant_limiter/
+    per_tenant_share_pct) -- protects a shared model's own AWS quota
+    from being monopolized by one busy tenant, on top of (not instead
+    of) the overall-model gate ModelQuotaLimiterTests above covers."""
+
+    def setUp(self):
+        self._client = boto3.client("dynamodb", region_name=REGION)
+        _create_table(self._client)
+        self.clock = FakeClock()
+
+    def _limiter(self, *, per_tenant_share_pct: float = 0.4) -> ModelQuotaLimiter:
+        return ModelQuotaLimiter(
+            cache=ModelQuotaCache(table_name=TABLE_NAME, region=REGION, client=self._client, clock=self.clock),
+            limiter=DynamoDbRateLimiter(
+                table_name=TABLE_NAME, region=REGION, client=self._client, clock=self.clock,
+                key_prefix="ratelimit#model#",
+            ),
+            tenant_limiter=DynamoDbRateLimiter(
+                table_name=TABLE_NAME, region=REGION, client=self._client, clock=self.clock,
+                key_prefix="ratelimit#model_tenant#",
+            ),
+            per_tenant_share_pct=per_tenant_share_pct,
+        )
+
+    def test_no_tenant_id_skips_the_fair_share_check_entirely(self):
+        """Backward compatible: a caller that never passes tenant_id
+        (e.g. an older call site) behaves exactly like
+        ModelQuotaLimiterTests -- overall-model gate only."""
+        _put_quota(self._client, "model-a", 10)
+        limiter = self._limiter()
+
+        for _ in range(10):
+            self.assertTrue(limiter.allow("model-a"))  # no tenant_id at all
+        self.assertFalse(limiter.allow("model-a"))
+
+    def test_no_tenant_limiter_configured_skips_the_fair_share_check(self):
+        """Backward compatible the other way: tenant_id is passed, but
+        this ModelQuotaLimiter instance has no tenant_limiter wired up
+        (matches settings.model_quotas_table_name being set but an
+        older construction site)."""
+        _put_quota(self._client, "model-a", 10)
+        limiter = ModelQuotaLimiter(
+            cache=ModelQuotaCache(table_name=TABLE_NAME, region=REGION, client=self._client, clock=self.clock),
+            limiter=DynamoDbRateLimiter(
+                table_name=TABLE_NAME, region=REGION, client=self._client, clock=self.clock,
+                key_prefix="ratelimit#model#",
+            ),
+        )
+
+        for _ in range(10):
+            self.assertTrue(limiter.allow("model-a", "busy-tenant"))
+
+    def test_single_tenant_is_capped_below_the_models_full_budget(self):
+        _put_quota(self._client, "model-a", 10)  # per-tenant share: 10 * 0.4 = 4
+        limiter = self._limiter(per_tenant_share_pct=0.4)
+
+        for _ in range(4):
+            self.assertTrue(limiter.allow("model-a", "busy-tenant"))
+        # Model-wide budget (10) still has 6 left, but this tenant's
+        # own 40% share (4) is exhausted.
+        self.assertFalse(limiter.allow("model-a", "busy-tenant"))
+
+    def test_a_different_tenant_is_unaffected_by_one_tenants_exhausted_share(self):
+        _put_quota(self._client, "model-a", 10)
+        limiter = self._limiter(per_tenant_share_pct=0.4)
+
+        for _ in range(4):
+            self.assertTrue(limiter.allow("model-a", "busy-tenant"))
+        self.assertFalse(limiter.allow("model-a", "busy-tenant"))
+
+        self.assertTrue(limiter.allow("model-a", "quiet-tenant"))  # its own, separate share
+
+    def test_overall_model_exhaustion_rejects_even_a_tenant_under_its_own_share(self):
+        _put_quota(self._client, "model-a", 2)  # tiny overall budget
+        limiter = self._limiter(per_tenant_share_pct=0.9)  # generous per-tenant share (1.8 -> 1)
+
+        self.assertTrue(limiter.allow("model-a", "tenant-a"))
+        self.assertTrue(limiter.allow("model-a", "tenant-b"))
+        # Overall model budget (2) is now exhausted -- rejected even
+        # though neither tenant is anywhere near its own share.
+        self.assertFalse(limiter.allow("model-a", "tenant-a"))
+
+    def test_per_tenant_share_is_never_less_than_one(self):
+        """A tiny model quota (e.g. 1 rpm) times a small share_pct
+        would floor to 0, which would mean a tenant can NEVER be
+        admitted even with a free model budget -- max(1, ...) prevents
+        that degenerate case."""
+        _put_quota(self._client, "model-a", 1)
+        limiter = self._limiter(per_tenant_share_pct=0.1)  # 1 * 0.1 = 0.1 -> floors to 0 without the max(1, ...)
+
+        self.assertTrue(limiter.allow("model-a", "acme"))
+
+
 if __name__ == "__main__":
     unittest.main()

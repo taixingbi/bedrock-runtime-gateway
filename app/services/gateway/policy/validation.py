@@ -28,7 +28,7 @@ _KNOWN_FIELDS = frozenset({
     "allow_guardrail_bypass_on_error", "debug_capture_enabled",
     "debug_capture_retention_days", "max_concurrency", "monthly_budget",
     "data_classification", "daily_budget", "application_budgets",
-    "monthly_budget_soft_threshold_pct", "priority_class",
+    "monthly_budget_soft_threshold_pct", "priority_class", "tpm_limit",
 })
 
 _KNOWN_PRIORITY_CLASSES = frozenset({"critical", "standard", "best_effort"})
@@ -135,6 +135,11 @@ def validate_policy_changes(changes: Dict[str, Any]) -> None:
         value = changes["priority_class"]
         if not isinstance(value, str) or value not in _KNOWN_PRIORITY_CLASSES:
             raise PolicyValidationError(f"'priority_class' must be one of {sorted(_KNOWN_PRIORITY_CLASSES)}")
+
+    if "tpm_limit" in changes:
+        value = changes["tpm_limit"]
+        if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+            raise PolicyValidationError("'tpm_limit' must be an integer >= 1")
 
     if "slo" in changes:
         slo = changes["slo"]

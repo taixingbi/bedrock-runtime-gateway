@@ -207,6 +207,26 @@ class CertifiedRouterTests(unittest.TestCase):
         called_models = {c["model_id"] for c in fake.calls}
         self.assertNotIn("model-a", called_models)  # never attempted -- skipped before the call
 
+    def test_tenant_id_is_forwarded_to_the_quota_limiter(self):
+        """The actual wiring test.py's ModelQuotaLimiterFairShareTests
+        can't cover on its own -- proves converse()'s own tenant_id
+        param actually reaches allow(model_id, tenant_id), not just
+        that the limiter's own fair-share math works in isolation."""
+        fake = FakeConverseClient()
+        recording_limiter = _RecordingQuotaLimiterStub()
+        router = CertifiedRouter(
+            converse_client=fake, circuit_breaker=CircuitBreaker(), route_sets={},
+            certified_model_ids={"model-a"},
+            model_quota_limiter=recording_limiter,
+        )
+
+        router.converse(
+            primary_model_id="model-a", route_set_name=None, messages=[], max_tokens=100, temperature=0.5,
+            tenant_id="acme",
+        )
+
+        self.assertEqual(recording_limiter.calls, [("model-a", "acme")])
+
     def test_all_candidates_over_quota_raises_all_routes_unavailable(self):
         fake = FakeConverseClient()
         route_sets = {"rs1": RouteSet(name="rs1", primary="model-a", fallbacks=["model-b"])}
@@ -284,8 +304,21 @@ class _QuotaLimiterStub:
     def __init__(self, *, deny):
         self._deny = set(deny)
 
-    def allow(self, model_id: str) -> bool:
+    def allow(self, model_id: str, tenant_id=None) -> bool:
         return model_id not in self._deny
+
+
+class _RecordingQuotaLimiterStub:
+    """Always admits -- records every (model_id, tenant_id) pair it
+    was called with, so a test can assert on propagation without
+    needing real DynamoDB/moto machinery."""
+
+    def __init__(self):
+        self.calls = []
+
+    def allow(self, model_id: str, tenant_id=None) -> bool:
+        self.calls.append((model_id, tenant_id))
+        return True
 
 
 class RoutingIntegrationTests(unittest.TestCase):

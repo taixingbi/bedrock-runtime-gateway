@@ -66,6 +66,66 @@ class ConcurrencyLimiterTests(unittest.TestCase):
         self.assertTrue(limiter.try_acquire("acme"))
 
 
+class ConcurrencyLimiterPriorityTests(unittest.TestCase):
+    """Reserved-headroom priority enforcement (TenantPolicy.priority_class):
+    a "best_effort" request is additionally capped at best_effort_max_pct
+    of global_max, guaranteeing the rest is always obtainable by
+    "critical"/"standard" traffic regardless of how busy a best_effort
+    tenant is."""
+
+    def test_default_priority_class_is_unaffected_by_the_reserved_cap(self):
+        """priority_class defaults to "standard" everywhere -- no
+        behavior change for any existing caller that never passes it."""
+        limiter = ConcurrencyLimiter(global_max=2, default_tenant_max=10, best_effort_max_pct=0.5)
+        self.assertTrue(limiter.try_acquire("acme"))
+        self.assertTrue(limiter.try_acquire("acme"))  # both standard, unrestricted by best_effort cap
+        self.assertFalse(limiter.try_acquire("acme"))  # global cap still applies
+
+    def test_best_effort_is_capped_below_global_even_with_room_in_global(self):
+        limiter = ConcurrencyLimiter(global_max=10, default_tenant_max=10, best_effort_max_pct=0.5)
+        for _ in range(5):
+            self.assertTrue(limiter.try_acquire("busy-tenant", priority_class="best_effort"))
+        # global_max=10 has room, but best_effort_max=5 is exhausted.
+        self.assertFalse(limiter.try_acquire("busy-tenant", priority_class="best_effort"))
+
+    def test_standard_traffic_always_gets_its_guaranteed_headroom(self):
+        """The actual noisy-neighbor guarantee: a busy best_effort
+        tenant exhausting its own reserved share can never prevent
+        standard traffic from using the rest of global_max."""
+        limiter = ConcurrencyLimiter(global_max=10, default_tenant_max=10, best_effort_max_pct=0.5)
+        for _ in range(5):
+            self.assertTrue(limiter.try_acquire("busy-best-effort", priority_class="best_effort"))
+        self.assertFalse(limiter.try_acquire("busy-best-effort", priority_class="best_effort"))
+
+        # Standard traffic is untouched by best_effort's own sub-cap --
+        # it can still use the remaining half of the global pool.
+        for _ in range(5):
+            self.assertTrue(limiter.try_acquire("critical-tenant", priority_class="standard"))
+        self.assertFalse(limiter.try_acquire("critical-tenant", priority_class="standard"))  # global now exhausted
+
+    def test_release_frees_the_best_effort_reservation(self):
+        limiter = ConcurrencyLimiter(global_max=10, default_tenant_max=10, best_effort_max_pct=0.1)  # cap=1
+        token = limiter.try_acquire("acme", priority_class="best_effort")
+        self.assertTrue(token)
+        self.assertFalse(limiter.try_acquire("other", priority_class="best_effort"))  # cap of 1 exhausted
+
+        limiter.release("acme", token, priority_class="best_effort")
+
+        self.assertTrue(limiter.try_acquire("other", priority_class="best_effort"))  # freed
+
+    def test_release_with_wrong_priority_class_leaks_the_reservation(self):
+        """Documents the real contract, not a defect: release() must be
+        called with the SAME priority_class try_acquire() used --
+        maintained_lease does this automatically in production. Calling
+        it with the wrong value here deliberately leaves the
+        best_effort counter stuck, to prove the contract matters."""
+        limiter = ConcurrencyLimiter(global_max=10, default_tenant_max=10, best_effort_max_pct=0.1)
+        token = limiter.try_acquire("acme", priority_class="best_effort")
+        limiter.release("acme", token, priority_class="standard")  # wrong on purpose
+
+        self.assertFalse(limiter.try_acquire("other", priority_class="best_effort"))  # still "held"
+
+
 class BlockingCallRunnerTests(unittest.IsolatedAsyncioTestCase):
     async def test_runs_sync_function_and_returns_result(self):
         runner = BlockingCallRunner(max_workers=2, default_timeout_s=5.0)

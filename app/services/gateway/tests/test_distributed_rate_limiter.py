@@ -99,5 +99,46 @@ class DynamoDbRateLimiterTests(unittest.TestCase):
         self.assertFalse(limiter_task_b.allow("acme", rpm_limit=2))
 
 
+@mock_aws
+class DynamoDbRateLimiterAmountTests(unittest.TestCase):
+    """`amount` (default 1.0, every RPM caller's exact prior behavior)
+    -- pipeline.enforce_token_rate_limit is the real caller that passes
+    a variable amount (an estimated token count); these test the
+    underlying mechanic directly, independent of TPM."""
+
+    def setUp(self):
+        self._client = boto3.client("dynamodb", region_name=REGION)
+        _create_table(self._client)
+        self.clock = FakeClock()
+
+    def test_default_amount_is_one_unchanged_from_before_this_param_existed(self):
+        limiter = DynamoDbRateLimiter(
+            table_name=TABLE_NAME, region=REGION, clock=self.clock, client=self._client,
+        )
+        self.assertTrue(limiter.allow("acme", rpm_limit=1))
+        self.assertFalse(limiter.allow("acme", rpm_limit=1))
+
+    def test_a_single_call_can_consume_more_than_one_unit(self):
+        limiter = DynamoDbRateLimiter(
+            table_name=TABLE_NAME, region=REGION, clock=self.clock, client=self._client,
+        )
+        self.assertTrue(limiter.allow("acme", rpm_limit=1000, amount=999.0))
+        self.assertFalse(limiter.allow("acme", rpm_limit=1000, amount=2.0))  # only 1 left
+        self.assertTrue(limiter.allow("acme", rpm_limit=1000, amount=1.0))  # exactly what's left
+
+    def test_amount_exceeding_full_capacity_is_always_rejected(self):
+        limiter = DynamoDbRateLimiter(
+            table_name=TABLE_NAME, region=REGION, clock=self.clock, client=self._client,
+        )
+        self.assertFalse(limiter.allow("acme", rpm_limit=100, amount=101.0))
+
+    def test_rejected_amount_consumes_nothing(self):
+        limiter = DynamoDbRateLimiter(
+            table_name=TABLE_NAME, region=REGION, clock=self.clock, client=self._client,
+        )
+        self.assertFalse(limiter.allow("acme", rpm_limit=10, amount=11.0))
+        self.assertTrue(limiter.allow("acme", rpm_limit=10, amount=10.0))  # full budget still intact
+
+
 if __name__ == "__main__":
     unittest.main()

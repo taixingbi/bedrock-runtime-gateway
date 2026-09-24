@@ -30,9 +30,14 @@ class TokenBucketRateLimiter:
         self._buckets: Dict[str, _Bucket] = {}
         self._lock = threading.Lock()
 
-    def allow(self, tenant_id: str, *, rpm_limit: int) -> bool:
-        """Returns True and consumes one token if tenant_id is within its
-        rpm_limit budget; returns False (consuming nothing) otherwise."""
+    def allow(self, tenant_id: str, *, rpm_limit: int, amount: float = 1.0) -> bool:
+        """Returns True and consumes `amount` tokens if tenant_id has
+        that much budget available; returns False (consuming nothing)
+        otherwise. `amount` defaults to 1.0 (a single request) -- every
+        existing RPM caller is unaffected; pipeline.py's TPM stage is
+        the one caller that passes a real request's estimated token
+        count instead, reusing this same bucket math against a
+        differently-keyed bucket (see enforce_token_rate_limit)."""
         capacity = float(max(rpm_limit, 0))
         refill_rate_per_s = capacity / 60.0
         now = self._clock()
@@ -47,8 +52,8 @@ class TokenBucketRateLimiter:
             bucket.tokens = min(capacity, bucket.tokens + elapsed * refill_rate_per_s)
             bucket.last_refill = now
 
-            if bucket.tokens >= 1.0:
-                bucket.tokens -= 1.0
+            if bucket.tokens >= amount:
+                bucket.tokens -= amount
                 return True
             return False
 
@@ -107,7 +112,11 @@ class DynamoDbRateLimiter:
             client = boto3.client("dynamodb", region_name=region)
         self._client = client
 
-    def allow(self, tenant_id: str, *, rpm_limit: int) -> bool:
+    def allow(self, tenant_id: str, *, rpm_limit: int, amount: float = 1.0) -> bool:
+        """`amount` (default 1.0, every existing RPM caller's exact
+        prior behavior) is how many bucket units this one call
+        consumes -- see TokenBucketRateLimiter.allow's own note on
+        why (TPM's variable per-request token estimate)."""
         capacity = float(max(rpm_limit, 0))
         refill_rate_per_s = capacity / 60.0
         pk = f"{self._key_prefix}{tenant_id}"
@@ -126,17 +135,17 @@ class DynamoDbRateLimiter:
                 elapsed = max(0.0, now - float(last_refill_ms) / 1000.0)
                 tokens = min(capacity, tokens + elapsed * refill_rate_per_s)
 
-            if tokens < 1.0:
+            if tokens < amount:
                 # Still write the refilled (but not consumed) state back --
                 # otherwise a request that arrives after a long idle gap
-                # but finds tokens < 1 would never persist its own partial
-                # refill, and a future caller recomputes from the same
-                # stale last_refill_ms every time. Same CAS write, just no
-                # -1.0 consumption.
+                # but finds insufficient tokens would never persist its own
+                # partial refill, and a future caller recomputes from the
+                # same stale last_refill_ms every time. Same CAS write,
+                # just no consumption.
                 self._try_write(pk, tokens, now, last_refill_ms)
                 return False
 
-            if self._try_write(pk, tokens - 1.0, now, last_refill_ms):
+            if self._try_write(pk, tokens - amount, now, last_refill_ms):
                 return True
             # Condition failed -- another request updated this row between
             # our read and write; retry with a fresh read.

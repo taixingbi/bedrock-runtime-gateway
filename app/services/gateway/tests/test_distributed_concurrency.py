@@ -286,5 +286,97 @@ class DynamoDbConcurrencyLimiterLeaseTests(unittest.TestCase):
         self.assertEqual(limiter.current_global_count(), 1)
 
 
+@mock_aws
+class DynamoDbConcurrencyLimiterPriorityTests(unittest.TestCase):
+    """Reserved-headroom priority enforcement -- same guarantee as
+    ConcurrencyLimiterPriorityTests (test_concurrency.py), enforced via
+    a third atomic counter item in the same transact_write_items call
+    instead of an in-process int."""
+
+    def setUp(self):
+        self._client = boto3.client("dynamodb", region_name=REGION)
+        _create_table(self._client)
+        self.limiter = DynamoDbConcurrencyLimiter(
+            table_name=TABLE_NAME, region=REGION, global_max=10, default_tenant_max=10,
+            best_effort_max_pct=0.5, client=self._client,
+        )
+
+    def test_default_priority_class_is_unaffected_by_the_reserved_cap(self):
+        for _ in range(10):
+            self.assertTrue(self.limiter.try_acquire("acme"))  # implicit "standard"
+        self.assertFalse(self.limiter.try_acquire("acme"))
+        self.assertEqual(self.limiter.current_best_effort_count(), 0)
+
+    def test_best_effort_is_capped_below_global_even_with_room_in_global(self):
+        for _ in range(5):
+            self.assertTrue(self.limiter.try_acquire("busy-tenant", priority_class="best_effort"))
+        self.assertFalse(self.limiter.try_acquire("busy-tenant", priority_class="best_effort"))
+        self.assertEqual(self.limiter.current_global_count(), 5)  # global_max=10 still has room
+
+    def test_standard_traffic_always_gets_its_guaranteed_headroom(self):
+        for _ in range(5):
+            self.assertTrue(self.limiter.try_acquire("busy-best-effort", priority_class="best_effort"))
+        self.assertFalse(self.limiter.try_acquire("busy-best-effort", priority_class="best_effort"))
+
+        for _ in range(5):
+            self.assertTrue(self.limiter.try_acquire("critical-tenant", priority_class="standard"))
+        self.assertFalse(self.limiter.try_acquire("critical-tenant", priority_class="standard"))
+
+    def test_release_frees_the_best_effort_reservation(self):
+        limiter = DynamoDbConcurrencyLimiter(
+            table_name=TABLE_NAME, region=REGION, global_max=10, default_tenant_max=10,
+            best_effort_max_pct=0.1, client=self._client,  # cap=1
+        )
+        token = limiter.try_acquire("acme", priority_class="best_effort")
+        self.assertTrue(token)
+        self.assertEqual(limiter.current_best_effort_count(), 1)
+        self.assertFalse(limiter.try_acquire("other", priority_class="best_effort"))
+
+        limiter.release("acme", token, priority_class="best_effort")
+
+        self.assertEqual(limiter.current_best_effort_count(), 0)
+        self.assertTrue(limiter.try_acquire("other", priority_class="best_effort"))
+
+    def test_reconcile_compensates_the_best_effort_counter_for_an_expired_best_effort_lease(self):
+        limiter = DynamoDbConcurrencyLimiter(
+            table_name=TABLE_NAME, region=REGION, global_max=10, default_tenant_max=10,
+            best_effort_max_pct=0.1, lease_ttl_s=1.0, client=self._client,  # cap=1
+        )
+        limiter.try_acquire("acme", priority_class="best_effort")  # "crashes", never releases
+        self.assertEqual(limiter.current_best_effort_count(), 1)
+
+        swept = limiter.reconcile(now=__import__("time").time() + 100)
+
+        self.assertEqual(swept, 1)
+        self.assertEqual(limiter.current_best_effort_count(), 0)
+        self.assertEqual(limiter.current_global_count(), 0)
+
+    def test_reconcile_does_not_touch_best_effort_counter_for_a_standard_lease(self):
+        """The counter-compensation must be conditional on the lease's
+        own stored priority_class, not blindly applied to every swept
+        lease -- otherwise a crashed standard-priority request would
+        incorrectly free budget from the best_effort reservation."""
+        limiter = DynamoDbConcurrencyLimiter(
+            table_name=TABLE_NAME, region=REGION, global_max=10, default_tenant_max=10,
+            best_effort_max_pct=0.5, lease_ttl_s=1.0, client=self._client,
+        )
+        limiter.try_acquire("acme", priority_class="standard")
+        self.assertEqual(limiter.current_best_effort_count(), 0)
+
+        swept = limiter.reconcile(now=__import__("time").time() + 100)
+
+        self.assertEqual(swept, 1)
+        self.assertEqual(limiter.current_best_effort_count(), 0)  # never went negative or touched
+        self.assertEqual(limiter.current_global_count(), 0)
+
+    def test_best_effort_max_of_zero_never_admits_best_effort(self):
+        limiter = DynamoDbConcurrencyLimiter(
+            table_name=TABLE_NAME, region=REGION, global_max=10, default_tenant_max=10,
+            best_effort_max_pct=0.0, client=self._client,
+        )
+        self.assertIsNone(limiter.try_acquire("acme", priority_class="best_effort"))
+        self.assertTrue(limiter.try_acquire("acme", priority_class="standard"))  # unaffected
+
+
 if __name__ == "__main__":
     unittest.main()

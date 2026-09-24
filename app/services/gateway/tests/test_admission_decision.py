@@ -60,6 +60,33 @@ class AdmissionDecisionUnitTests(unittest.TestCase):
         self.assertEqual(decision.stage, "rate_limit")
         self.assertEqual(decision.error.code, "QUOTA_EXCEEDED")
 
+    def test_token_rate_limit_stage_attributed(self):
+        limiter = TokenBucketRateLimiter()
+        policy = _policy(tpm_limit=100)
+        pipeline.enforce_token_rate_limit(policy, rate_limiter=limiter, estimated_tokens=100)  # exhaust it
+
+        decision = pipeline.admission_decision(
+            policy, rate_limiter=limiter, usage_store=InMemoryUsageStore(), month=current_month(),
+            estimated_tokens=1,
+        )
+
+        self.assertFalse(decision.allowed)
+        self.assertEqual(decision.stage, "token_rate_limit")
+        self.assertEqual(decision.error.code, "TOKEN_RATE_LIMIT_EXCEEDED")
+
+    def test_no_estimated_tokens_skips_the_tpm_stage_even_with_tpm_limit_set(self):
+        """A caller with no request body available yet (or that never
+        passes estimated_tokens) must not accidentally trigger TPM --
+        estimated_tokens=None (the default) is the opt-out."""
+        limiter = TokenBucketRateLimiter()
+        policy = _policy(tpm_limit=1)  # would reject any real estimate >=2
+
+        decision = pipeline.admission_decision(
+            policy, rate_limiter=limiter, usage_store=InMemoryUsageStore(), month=current_month(),
+        )
+
+        self.assertTrue(decision.allowed)
+
     def test_budget_stage_attributed(self):
         usage_store = InMemoryUsageStore()
         usage_store.add_and_get("acme", current_month(), 100.0)
@@ -128,6 +155,20 @@ class AdmissionDecisionIntegrationTests(unittest.TestCase):
 
         self.assertEqual(resp.status_code, 403)
         self.assertEqual(resp.json()["error"]["code"], "TENANT_BLOCKED")
+
+    def test_tpm_limit_rejects_a_request_over_its_token_budget_end_to_end(self):
+        policy_store = InMemoryPolicyStore(
+            {"acme": _policy(tpm_limit=10)}  # tiny -- any real request estimate exceeds it
+        )
+        client, fixture = self._app(policy_store=policy_store)
+        token = fixture.token(tenant_id="acme", roles=["developer"])
+
+        resp = client.post(
+            "/v1/chat", json={"messages": [{"role": "user", "content": "hi"}]}, headers=auth_header(token)
+        )
+
+        self.assertEqual(resp.status_code, 429)
+        self.assertEqual(resp.json()["error"]["code"], "TOKEN_RATE_LIMIT_EXCEEDED")
 
 
 if __name__ == "__main__":

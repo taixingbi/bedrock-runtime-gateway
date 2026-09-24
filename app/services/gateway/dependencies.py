@@ -29,7 +29,8 @@ def build_guardrail_client(settings):
 
 def build_concurrency_limiter(settings):
     limits = dict(global_max=settings.concurrency_global_max,
-                  default_tenant_max=settings.concurrency_default_tenant_max)
+                  default_tenant_max=settings.concurrency_default_tenant_max,
+                  best_effort_max_pct=settings.concurrency_best_effort_max_pct)
     if settings.admission_control_table_name:
         return DynamoDbConcurrencyLimiter(
             table_name=settings.admission_control_table_name, region=settings.aws_region,

@@ -87,10 +87,32 @@ class TenantPolicy:
     daily_budget: Optional[float] = None
     application_budgets: Dict[str, float] = field(default_factory=dict)
     monthly_budget_soft_threshold_pct: Optional[float] = None
-    # Plan section 34.6: logged/reported only, not enforced -- see
-    # pipeline.admission_decision's docstring for why real priority
-    # preemption isn't built yet.
+    # Plan section 34.6: enforced as reserved-headroom, not true
+    # mid-flight preemption -- an in-flight Bedrock call can't be
+    # safely cancelled (concurrency.py's own module docstring), so
+    # "critical"/"standard" traffic can never be bumped out of a slot
+    # a "best_effort" request already holds. What IS enforced:
+    # "best_effort" requests are additionally capped at
+    # Settings.concurrency_best_effort_max_pct of the GLOBAL
+    # concurrency pool (concurrency.py's ConcurrencyLimiter/
+    # DynamoDbConcurrencyLimiter), guaranteeing the remaining fraction
+    # is always obtainable by "critical"/"standard" tenants regardless
+    # of how busy a "best_effort" one is. "critical"/"standard"
+    # themselves aren't distinguished from each other anywhere yet --
+    # only the best_effort floor is real.
     priority_class: str = "standard"
+    # Tokens-per-minute, separate from rpm_limit (request *rate*): a
+    # tenant sending few but very large requests stays fully compliant
+    # on RPM while consuming disproportionate Bedrock latency/cost --
+    # this bounds that directly. None (default) means no TPM cap,
+    # opt-in like monthly_budget. Necessarily an ESTIMATE checked
+    # before the call (usage/token_estimate.py) -- Bedrock's real
+    # input-token count isn't known until after the call, and
+    # completion tokens aren't known until the model finishes
+    # generating; the estimate reserves the full requested max_tokens
+    # as a worst-case, never refunded after the real (usually smaller)
+    # completion -- see pipeline.enforce_token_rate_limit.
+    tpm_limit: Optional[int] = None
 
 
 class UnknownTenantError(Exception):

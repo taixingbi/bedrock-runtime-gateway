@@ -72,11 +72,13 @@ def process_one(
 
 
     limiter = concurrency_limiter
-    token = limiter.try_acquire(job.tenant_id, tenant_max=policy.max_concurrency)
+    token = limiter.try_acquire(
+        job.tenant_id, tenant_max=policy.max_concurrency, priority_class=policy.priority_class,
+    )
     if not token:
         job_store.finish(dataclasses.replace(job, status=JobStatus.QUEUED))
         raise JobBusyError("inference capacity exhausted")
-    with maintained_lease(limiter, job.tenant_id, token):
+    with maintained_lease(limiter, job.tenant_id, token, priority_class=policy.priority_class):
         with heartbeat(lambda: job_store.renew(job)):
             _execute(job, policy, job_store, guardrail_client, router, usage_store)
 
@@ -90,6 +92,7 @@ def _execute(job, policy, job_store, guardrail_client, router, usage_store):
             messages=messages,
             max_tokens=job.max_tokens,
             temperature=job.temperature,
+            tenant_id=job.tenant_id,
         )
     except BedrockInvocationError as exc:
         job_store.finish(dataclasses.replace(

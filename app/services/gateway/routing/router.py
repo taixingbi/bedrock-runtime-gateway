@@ -101,14 +101,16 @@ class CertifiedRouter:
         messages: List[BedrockChatMessage],
         max_tokens: int,
         temperature: float,
+        tenant_id: Optional[str] = None,
     ) -> RoutedResult:
         """Tries primary_model_id, then the route set's fallbacks in
         order, skipping any model whose breaker is currently open,
-        that's over its own AWS-quota budget (model_quota_limiter, if
-        configured), or that isn't certified. Returns the first
-        success. Raises the last BedrockInvocationError if every
-        attempted candidate failed, or AllRoutesUnavailableError if
-        every candidate was skipped -- including when primary_model_id
+        that's over its own AWS-quota budget or (when `tenant_id` is
+        supplied) this tenant's own fair share of it
+        (model_quota_limiter, if configured), or that isn't certified.
+        Returns the first success. Raises the last BedrockInvocationError
+        if every attempted candidate failed, or AllRoutesUnavailableError
+        if every candidate was skipped -- including when primary_model_id
         itself isn't certified. Callers should
         prefer pipeline.enforce_model_certification for that specific
         case (a clean 403 before ever reaching here); this is the
@@ -123,7 +125,7 @@ class CertifiedRouter:
         for index, model_id in enumerate(candidates):
             if not self._breaker.allow(model_id):
                 continue
-            if self._model_quota_limiter is not None and not self._model_quota_limiter.allow(model_id):
+            if self._model_quota_limiter is not None and not self._model_quota_limiter.allow(model_id, tenant_id):
                 continue
             try:
                 result = self.converse_client.converse(

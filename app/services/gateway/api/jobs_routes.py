@@ -28,6 +28,7 @@ from ..guardrails.client import GuardrailClient
 from ..jobs.models import Job, JobMessage, JobNotFoundError, JobStatus
 from ..jobs.queue import JobQueue
 from ..jobs.store import JobStore
+from ..usage.token_estimate import estimate_tokens
 from ..policy.cache import PolicySnapshotCache
 from ..policy.rate_limiter import TokenBucketRateLimiter
 from ..routing.model_registry import ModelRegistryEntry
@@ -83,6 +84,7 @@ def build_jobs_router(
         admission = pipeline.admission_decision(
             policy, rate_limiter=rate_limiter, usage_store=usage_store,
             month=current_month(), day=current_day(), application_id=identity.application_id,
+            estimated_tokens=estimate_tokens(job_request.messages, job_request.max_tokens),
         )
         if not admission.allowed:
             exc = admission.error

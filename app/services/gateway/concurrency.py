@@ -48,14 +48,28 @@ class ConcurrencyLimiter:
     on the event loop thread, so this must be safe across real OS
     threads, not just concurrent coroutines."""
 
-    def __init__(self, *, global_max: int, default_tenant_max: int):
+    def __init__(self, *, global_max: int, default_tenant_max: int, best_effort_max_pct: float = 0.5):
         self._global_max = global_max
         self._default_tenant_max = default_tenant_max
+        # Reserved-headroom priority enforcement: a "best_effort" tenant
+        # is additionally capped at this fraction of global_max, on top
+        # of (not instead of) the existing global+tenant caps. Since
+        # this counter shares the SAME global pool, a busy best_effort
+        # tenant can never consume more than its own slice -- the
+        # remainder of global_max is always obtainable by
+        # "critical"/"standard" traffic, which isn't subject to this
+        # sub-cap at all. Not true mid-flight preemption (an in-flight
+        # Bedrock call can't be safely cancelled -- see this module's
+        # own docstring on why), just a guaranteed floor of headroom.
+        self._best_effort_max = int(global_max * best_effort_max_pct)
         self._global_count = 0
+        self._best_effort_count = 0
         self._tenant_counts: Dict[str, int] = {}
         self._lock = threading.Lock()
 
-    def try_acquire(self, tenant_id: str, *, tenant_max: Optional[int] = None) -> Optional[str]:
+    def try_acquire(
+        self, tenant_id: str, *, tenant_max: Optional[int] = None, priority_class: str = "standard",
+    ) -> Optional[str]:
         """Non-blocking: returns None immediately (consuming nothing)
         rather than waiting, so a saturated limiter surfaces as a fast
         429 instead of queueing requests behind an already-slow backend.
@@ -68,24 +82,40 @@ class ConcurrencyLimiter:
         class doesn't actually need the token itself: a crashed
         process's in-memory _tenant_counts simply vanishes with it, no
         lease-cleanup problem exists here the way it does for the
-        DynamoDB-backed sibling."""
+        DynamoDB-backed sibling.
+
+        `priority_class` (default "standard", matching TenantPolicy's
+        own default) only changes behavior for "best_effort" -- see
+        __init__'s own note on the reserved-headroom mechanism this
+        gates."""
         limit = tenant_max if tenant_max is not None else self._default_tenant_max
         with self._lock:
             if self._global_count >= self._global_max:
                 return None
+            if priority_class == "best_effort" and self._best_effort_count >= self._best_effort_max:
+                return None
             if self._tenant_counts.get(tenant_id, 0) >= limit:
                 return None
             self._global_count += 1
+            if priority_class == "best_effort":
+                self._best_effort_count += 1
             self._tenant_counts[tenant_id] = self._tenant_counts.get(tenant_id, 0) + 1
             return str(uuid.uuid4())
 
-    def release(self, tenant_id: str, lease_token: Optional[str] = None) -> None:
+    def release(
+        self, tenant_id: str, lease_token: Optional[str] = None, *, priority_class: str = "standard",
+    ) -> None:
         """`lease_token` is accepted but ignored -- kept only so a
         caller written against DynamoDbConcurrencyLimiter's real
-        per-lease release() works unchanged against this class too."""
+        per-lease release() works unchanged against this class too.
+        `priority_class` must match what was passed to the
+        corresponding try_acquire() -- see maintained_lease, which
+        threads it through automatically."""
         with self._lock:
             if self._global_count > 0:
                 self._global_count -= 1
+            if priority_class == "best_effort" and self._best_effort_count > 0:
+                self._best_effort_count -= 1
             remaining = self._tenant_counts.get(tenant_id, 0) - 1
             if remaining > 0:
                 self._tenant_counts[tenant_id] = remaining
@@ -109,19 +139,26 @@ class DynamoDbConcurrencyLimiter:
 
     def __init__(
         self, *, table_name: str, region: str, global_max: int, default_tenant_max: int,
-        lease_ttl_s: float = 300.0, client: Optional[Any] = None,
+        lease_ttl_s: float = 300.0, client: Optional[Any] = None, best_effort_max_pct: float = 0.5,
     ):
         self._table_name = table_name
         self._global_max = global_max
         self._default_tenant_max = default_tenant_max
         self._lease_ttl_s = lease_ttl_s
+        # See ConcurrencyLimiter.__init__'s own note -- identical
+        # reserved-headroom reasoning, just enforced via one more
+        # atomic counter item in the same transaction instead of an
+        # in-process int.
+        self._best_effort_max = int(global_max * best_effort_max_pct)
         if client is None:
             import boto3
 
             client = boto3.client("dynamodb", region_name=region)
         self._client = client
 
-    def try_acquire(self, tenant_id: str, *, tenant_max: Optional[int] = None) -> Optional[str]:
+    def try_acquire(
+        self, tenant_id: str, *, tenant_max: Optional[int] = None, priority_class: str = "standard",
+    ) -> Optional[str]:
         import random
         import time as time_module
 
@@ -133,39 +170,52 @@ class DynamoDbConcurrencyLimiter:
         limit = tenant_max if tenant_max is not None else self._default_tenant_max
         if limit <= 0 or self._global_max <= 0:
             return None
+        if priority_class == "best_effort" and self._best_effort_max <= 0:
+            return None
         lease_id = str(uuid.uuid4())
         lease_pk = self._lease_pk(tenant_id, lease_id)
         lease_expires_at = time_module.time() + self._lease_ttl_s
-        try:
-            self._client.transact_write_items(
-                TransactItems=[
-                    self._acquire_item("concurrency#global", self._global_max),
-                    self._acquire_item(f"concurrency#tenant#{tenant_id}", limit),
-                    {
-                        "Put": {
-                            "TableName": self._table_name,
-                            "Item": {
-                                "pk": {"S": lease_pk},
-                                "tenant_id": {"S": tenant_id},
-                                "lease_expires_at": {"N": str(lease_expires_at)},
-                            },
-                            "ConditionExpression": "attribute_not_exists(pk)",
-                        }
+        transact_items = [
+            self._acquire_item("concurrency#global", self._global_max),
+            self._acquire_item(f"concurrency#tenant#{tenant_id}", limit),
+        ]
+        if priority_class == "best_effort":
+            transact_items.append(self._acquire_item("concurrency#best_effort", self._best_effort_max))
+        transact_items.append(
+            {
+                "Put": {
+                    "TableName": self._table_name,
+                    "Item": {
+                        "pk": {"S": lease_pk},
+                        "tenant_id": {"S": tenant_id},
+                        "priority_class": {"S": priority_class},
+                        "lease_expires_at": {"N": str(lease_expires_at)},
                     },
-                ]
-            )
+                    "ConditionExpression": "attribute_not_exists(pk)",
+                }
+            }
+        )
+        try:
+            self._client.transact_write_items(TransactItems=transact_items)
             return lease_id
         except ClientError as exc:
             if exc.response.get("Error", {}).get("Code") == "TransactionCanceledException":
                 return None
             raise
 
-    def release(self, tenant_id: str, lease_token: Optional[str] = None) -> None:
+    def release(
+        self, tenant_id: str, lease_token: Optional[str] = None, *, priority_class: str = "standard",
+    ) -> None:
+        """`priority_class` must match what was passed to the
+        corresponding try_acquire() -- see maintained_lease, which
+        threads it through automatically."""
         from botocore.exceptions import ClientError
 
         if not lease_token:
             raise ValueError("a lease token is required to release distributed capacity")
         items = [self._release_item("concurrency#global"), self._release_item(f"concurrency#tenant#{tenant_id}")]
+        if priority_class == "best_effort":
+            items.append(self._release_item("concurrency#best_effort"))
         if lease_token is not None:
             items.append(
                 {
@@ -230,11 +280,21 @@ class DynamoDbConcurrencyLimiter:
             for item in response.get("Items", []):
                 lease_pk = item["pk"]["S"]
                 tenant_id = item["tenant_id"]["S"]
+                # Older leases (written before priority_class existed
+                # on this item) have no such attribute -- treat as
+                # "standard", same as every other caller's default, not
+                # as best_effort.
+                lease_priority = item.get("priority_class", {}).get("S", "standard")
+                compensate_items = [
+                    self._release_item("concurrency#global"),
+                    self._release_item(f"concurrency#tenant#{tenant_id}"),
+                ]
+                if lease_priority == "best_effort":
+                    compensate_items.append(self._release_item("concurrency#best_effort"))
                 try:
                     self._client.transact_write_items(
                         TransactItems=[
-                            self._release_item("concurrency#global"),
-                            self._release_item(f"concurrency#tenant#{tenant_id}"),
+                            *compensate_items,
                             {
                                 "Delete": {
                                     "TableName": self._table_name,
@@ -261,6 +321,15 @@ class DynamoDbConcurrencyLimiter:
     def current_global_count(self) -> int:
         response = self._client.get_item(
             TableName=self._table_name, Key={"pk": {"S": "concurrency#global"}}
+        )
+        item = response.get("Item")
+        if item is None:
+            return 0
+        return int(item["count_val"]["N"])
+
+    def current_best_effort_count(self) -> int:
+        response = self._client.get_item(
+            TableName=self._table_name, Key={"pk": {"S": "concurrency#best_effort"}}
         )
         item = response.get("Item")
         if item is None:
@@ -338,11 +407,17 @@ class BlockingCallRunner:
 
 
 @contextmanager
-def maintained_lease(limiter, tenant_id: str, token: str):
+def maintained_lease(limiter, tenant_id: str, token: str, *, priority_class: str = "standard"):
     """Renew while work runs; release only after the underlying work ends.
 
     Renewal failure is reported, not hidden. A network partition cannot
     forcibly cancel a remote inference; callers must still use SDK timeouts.
+
+    `priority_class` (default "standard") must match what the caller
+    passed to the try_acquire() that produced `token` -- forwarded to
+    release() so the reserved-headroom best_effort counter (see
+    ConcurrencyLimiter/DynamoDbConcurrencyLimiter) is compensated
+    correctly, not left permanently decremented from acquire alone.
     """
     stopped = threading.Event()
     thread = None
@@ -361,4 +436,4 @@ def maintained_lease(limiter, tenant_id: str, token: str):
         stopped.set()
         if thread is not None:
             thread.join()
-        limiter.release(tenant_id, token)
+        limiter.release(tenant_id, token, priority_class=priority_class)

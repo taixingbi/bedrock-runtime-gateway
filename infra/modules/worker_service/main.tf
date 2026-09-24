@@ -131,6 +131,11 @@ data "aws_iam_policy_document" "task" {
     resources = [var.admission_control_table_arn]
   }
   statement {
+    sid       = "ModelQuota"
+    actions   = ["dynamodb:GetItem", "dynamodb:PutItem"]
+    resources = [var.model_quotas_table_arn]
+  }
+  statement {
     sid       = "Guardrails"
     actions   = ["bedrock:ApplyGuardrail"]
     resources = [var.guardrail_arn]

@@ -138,6 +138,19 @@ class Settings:
     # coordination across every task. One table backs both (different
     # `pk` prefixes) -- no reason to provision two.
     admission_control_table_name: str
+    # Empty means no per-model AWS-quota gate at all (routing/router.py
+    # falls back to breaker-only candidate skipping, same as before
+    # this existed). Set means routing/model_quota.py's
+    # ModelQuotaLimiter, reusing DynamoDbRateLimiter's own CAS/refill
+    # logic against a dedicated table rather than admission_control_
+    # table_name -- a deliberate exception to the "one table, no
+    # reason to provision two" note just above: this table's rows also
+    # hold rpm_limit/quota_type/updated_at, config data written by
+    # scripts/sync_model_quotas_from_aws.py on its own schedule, not
+    # just live request-time counters, so it doesn't fit the same
+    # "purely ephemeral counters" shape admission_control_table_name's
+    # rows do.
+    model_quotas_table_name: str
     # Plan section 35.18 -- how long DynamoDbConcurrencyLimiter's
     # per-request lease items live before reconcile() treats them as
     # abandoned (a crashed process, not a slow call) and compensates
@@ -255,6 +268,7 @@ def load_settings() -> Settings:
         blocking_call_thread_pool_size=_env_int("BLOCKING_CALL_THREAD_POOL_SIZE", 32),
         blocking_call_timeout_s=_env_float("BLOCKING_CALL_TIMEOUT_S", 60.0),
         admission_control_table_name=os.environ.get("ADMISSION_CONTROL_TABLE_NAME", ""),
+        model_quotas_table_name=os.environ.get("MODEL_QUOTAS_TABLE_NAME", ""),
         concurrency_lease_ttl_s=_env_float("CONCURRENCY_LEASE_TTL_S", 300.0),
         jobs_queue_url=os.environ.get("JOBS_QUEUE_URL", ""),
         jobs_table_name=os.environ.get("JOBS_TABLE_NAME", ""),

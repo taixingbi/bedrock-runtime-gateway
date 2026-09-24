@@ -441,6 +441,33 @@ resource "aws_iam_role_policy" "task_policy_versioning" {
   policy = data.aws_iam_policy_document.policy_versioning_access.json
 }
 
+# routing/model_quota.py's ModelQuotaLimiter/ModelQuotaCache -- two
+# rows per model_id in this table: "quota#<model_id>" (config,
+# GetItem-only from gateway-api's side, written only by
+# scripts/sync_model_quotas_from_aws.py running out-of-band) and
+# "ratelimit#model#<model_id>" (DynamoDbRateLimiter's own live CAS
+# counter, needs the same actions its tenant-scoped sibling already
+# has on admission_control_table_arn above).
+data "aws_iam_policy_document" "model_quota_access" {
+  statement {
+    sid = "ModelQuota"
+    # GetItem covers both rows (config read + counter read-before-CAS);
+    # PutItem is only ever issued by DynamoDbRateLimiter's own CAS
+    # write against the counter row -- gateway-api never PutItems the
+    # config row itself, but IAM has no per-row-prefix distinction to
+    # express that narrower intent without a LeadingKeys condition this
+    # table doesn't otherwise need.
+    actions   = ["dynamodb:GetItem", "dynamodb:PutItem"]
+    resources = [var.model_quotas_table_arn]
+  }
+}
+
+resource "aws_iam_role_policy" "task_model_quota" {
+  name   = "${var.name_prefix}-model-quota-access"
+  role   = aws_iam_role.task.id
+  policy = data.aws_iam_policy_document.model_quota_access.json
+}
+
 # S3AuditStore (services/gateway/telemetry/debug_capture.py) -- write
 # only, no Get/List/Delete. This is a durable audit trail; the gateway
 # task itself has no business reading its own past writes back, let

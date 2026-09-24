@@ -51,6 +51,7 @@ from .routing.certification import certified_model_ids as _certified_model_ids_f
 from .routing.certification import load_certified_models_from_yaml
 from .routing.model_registry import ModelRegistryEntry, load_model_registry_from_yaml
 from .routing.circuit_breaker import CircuitBreaker
+from .routing.model_quota import ModelQuotaCache, ModelQuotaLimiter
 from .routing.router import CertifiedRouter, RouteSet, load_route_sets_from_yaml
 from .telemetry.debug_capture import DebugCaptureStore, S3AuditStore
 from .telemetry.request_audit import InMemoryRequestAuditStore, RequestAuditStore, S3RequestAuditStore
@@ -104,6 +105,7 @@ def create_app(
     enterprise_group_resolver: Optional[EnterpriseGroupResolver] = None,
     model_registry: Optional[Dict[str, ModelRegistryEntry]] = None,
     request_audit_store: Optional[RequestAuditStore] = None,
+    model_quota_limiter: Optional[ModelQuotaLimiter] = None,
 ) -> FastAPI:
     settings = settings or load_settings()
     configure_logging(
@@ -210,11 +212,22 @@ def create_app(
 
     if policy_cache is None:
         policy_cache = PolicySnapshotCache(store=policy_store, ttl_s=settings.policy_cache_ttl_s)
+    if model_quota_limiter is None and settings.model_quotas_table_name:
+        model_quota_limiter = ModelQuotaLimiter(
+            cache=ModelQuotaCache(
+                table_name=settings.model_quotas_table_name, region=settings.aws_region,
+            ),
+            limiter=DynamoDbRateLimiter(
+                table_name=settings.model_quotas_table_name, region=settings.aws_region,
+                key_prefix="ratelimit#model#",
+            ),
+        )
     router = CertifiedRouter(
         converse_client=converse_client,
         circuit_breaker=circuit_breaker,
         route_sets=route_sets,
         certified_model_ids=certified_model_ids,
+        model_quota_limiter=model_quota_limiter,
     )
     if tracer is None:
         tracer = configure_tracing(

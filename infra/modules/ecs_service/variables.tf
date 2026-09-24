@@ -203,6 +203,18 @@ variable "admission_control_table_arn" {
   type = string
 }
 
+# routing/model_quota.py -- per-model AWS Bedrock quota (rpm_limit)
+# pulled from AWS Service Quotas by scripts/sync_model_quotas_from_aws.py,
+# plus DynamoDbRateLimiter's own live counter for enforcing it. A
+# separate table from admission_control_table_arn above (not "one
+# table, no reason to provision two" like that one) because this
+# table's config rows are written out-of-band by that sync script, not
+# just live request-time counters -- see config.py's own note on this
+# distinction.
+variable "model_quotas_table_arn" {
+  type = string
+}
+
 # M11 Application Onboarding (plan section 22) -- all four required,
 # same "known after apply on first create" reasoning as
 # jobs_queue_arn/jobs_table_arn/usage_table_arn above.

@@ -77,6 +77,14 @@ class DynamoDbRateLimiter:
     contention that exhausts every retry, a rate limiter's job is to
     protect the backend, so a few spurious 429s are the safer failure
     mode than silently admitting unlimited traffic.
+
+    `key_prefix` (default "ratelimit#tenant#", every existing caller's
+    exact prior pk format, unchanged) exists so a second instance can
+    share this same CAS/refill implementation against a differently-
+    keyed table row without colliding on the partition key namespace
+    -- see routing/model_quota.py's ModelQuotaLimiter, which points a
+    "ratelimit#model#"-prefixed instance at a model_id instead of a
+    tenant_id.
     """
 
     def __init__(
@@ -87,10 +95,12 @@ class DynamoDbRateLimiter:
         clock: Callable[[], float] = time.time,
         max_retries: int = 5,
         client: Optional[Any] = None,
+        key_prefix: str = "ratelimit#tenant#",
     ):
         self._table_name = table_name
         self._clock = clock
         self._max_retries = max_retries
+        self._key_prefix = key_prefix
         if client is None:
             import boto3
 
@@ -100,7 +110,7 @@ class DynamoDbRateLimiter:
     def allow(self, tenant_id: str, *, rpm_limit: int) -> bool:
         capacity = float(max(rpm_limit, 0))
         refill_rate_per_s = capacity / 60.0
-        pk = f"ratelimit#tenant#{tenant_id}"
+        pk = f"{self._key_prefix}{tenant_id}"
 
         for _attempt in range(self._max_retries):
             now = self._clock()

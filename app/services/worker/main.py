@@ -26,7 +26,9 @@ from ..gateway.dependencies import build_policy_store, build_guardrail_client, b
 from ..gateway.jobs.heartbeat import heartbeat
 from ..gateway.routing.certification import certified_model_ids, load_certified_models_from_yaml
 from ..gateway.routing.circuit_breaker import CircuitBreaker
+from ..gateway.routing.model_quota import ModelQuotaCache, ModelQuotaLimiter
 from ..gateway.routing.router import CertifiedRouter, load_route_sets_from_yaml
+from ..gateway.policy.rate_limiter import DynamoDbRateLimiter
 from ..gateway.telemetry.logging import configure_logging, get_logger, log_event
 from ..gateway.usage.store import DynamoDbUsageStore, InMemoryUsageStore
 
@@ -88,6 +90,23 @@ def main() -> None:
         failure_threshold=settings.circuit_breaker_failure_threshold,
         reset_timeout_s=settings.circuit_breaker_reset_timeout_s,
     )
+    # Same DynamoDB-backed gate gateway-api's own router uses, pointed
+    # at the same table -- Bedrock's account-wide quota is shared
+    # between synchronous /v1/chat traffic and this worker's async job
+    # traffic, so the two must coordinate through the same real
+    # counter, not each keep their own (unlike circuit_breaker above,
+    # which is process-local by pre-existing design on both sides).
+    model_quota_limiter = (
+        ModelQuotaLimiter(
+            cache=ModelQuotaCache(table_name=settings.model_quotas_table_name, region=settings.aws_region),
+            limiter=DynamoDbRateLimiter(
+                table_name=settings.model_quotas_table_name, region=settings.aws_region,
+                key_prefix="ratelimit#model#",
+            ),
+        )
+        if settings.model_quotas_table_name
+        else None
+    )
     router = CertifiedRouter(
         converse_client=converse_client,
         circuit_breaker=circuit_breaker,
@@ -95,6 +114,7 @@ def main() -> None:
         certified_model_ids=certified_model_ids(
             load_certified_models_from_yaml(settings.certified_models_path)
         ),
+        model_quota_limiter=model_quota_limiter,
     )
     usage_store = (
         DynamoDbUsageStore(table_name=settings.usage_table_name, region=settings.aws_region)

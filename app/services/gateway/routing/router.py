@@ -16,6 +16,7 @@ from typing import Dict, List, Optional, Set
 
 from ..inference.bedrock_client import BedrockChatMessage, BedrockInvocationError, ConverseClient, ConverseResult
 from .circuit_breaker import CircuitBreaker
+from .model_quota import ModelQuotaLimiter
 
 
 @dataclass(frozen=True)
@@ -26,13 +27,15 @@ class RouteSet:
 
 
 class AllRoutesUnavailableError(Exception):
-    """Every candidate model's circuit breaker is open -- no call was
-    even attempted. Distinct from BedrockInvocationError, which means a
-    call was attempted and failed."""
+    """Every candidate model was skipped -- circuit-open, over its own
+    AWS-quota budget (model_quota.ModelQuotaLimiter), or both -- no
+    call was even attempted. Distinct from BedrockInvocationError,
+    which means a call was attempted and failed."""
 
     def __init__(self, route_set_name: Optional[str]):
         super().__init__(
-            f"all candidate models are circuit-open for route_set={route_set_name!r}"
+            f"all candidate models are unavailable (circuit-open or over quota) "
+            f"for route_set={route_set_name!r}"
         )
 
 
@@ -66,11 +69,17 @@ class CertifiedRouter:
         circuit_breaker: CircuitBreaker,
         route_sets: Dict[str, RouteSet],
         certified_model_ids: Set[str],
+        model_quota_limiter: Optional[ModelQuotaLimiter] = None,
     ):
         self.converse_client = converse_client
         self._breaker = circuit_breaker
         self._route_sets = route_sets
         self.certified_model_ids = certified_model_ids
+        # Optional: None means no AWS-quota gate at all (matches every
+        # other optional-infra piece in this codebase, e.g. audit_store)
+        # -- every candidate is then only gated by the breaker, same as
+        # before this existed.
+        self._model_quota_limiter = model_quota_limiter
 
     def fallbacks_for(self, route_set_name: Optional[str]) -> List[str]:
         """Routing Invariant (M9): an uncertified model is filtered out
@@ -94,12 +103,13 @@ class CertifiedRouter:
         temperature: float,
     ) -> RoutedResult:
         """Tries primary_model_id, then the route set's fallbacks in
-        order, skipping any model whose breaker is currently open or
-        that isn't certified. Returns the first success. Raises the
-        last BedrockInvocationError if every attempted candidate
-        failed, or AllRoutesUnavailableError if every candidate was
-        skipped (all circuit-open, uncertified, or both) -- including
-        when primary_model_id itself isn't certified. Callers should
+        order, skipping any model whose breaker is currently open,
+        that's over its own AWS-quota budget (model_quota_limiter, if
+        configured), or that isn't certified. Returns the first
+        success. Raises the last BedrockInvocationError if every
+        attempted candidate failed, or AllRoutesUnavailableError if
+        every candidate was skipped -- including when primary_model_id
+        itself isn't certified. Callers should
         prefer pipeline.enforce_model_certification for that specific
         case (a clean 403 before ever reaching here); this is the
         backstop for any caller that doesn't go through that stage
@@ -112,6 +122,8 @@ class CertifiedRouter:
         last_error: Optional[BedrockInvocationError] = None
         for index, model_id in enumerate(candidates):
             if not self._breaker.allow(model_id):
+                continue
+            if self._model_quota_limiter is not None and not self._model_quota_limiter.allow(model_id):
                 continue
             try:
                 result = self.converse_client.converse(

@@ -189,6 +189,55 @@ class CertifiedRouterTests(unittest.TestCase):
             )
         self.assertEqual(len(fake.calls), 0)
 
+    def test_model_over_quota_is_skipped_in_favor_of_the_next_candidate(self):
+        fake = FakeConverseClient()
+        route_sets = {"rs1": RouteSet(name="rs1", primary="model-a", fallbacks=["model-b"])}
+        router = CertifiedRouter(
+            converse_client=fake, circuit_breaker=CircuitBreaker(), route_sets=route_sets,
+            certified_model_ids={"model-a", "model-b"},
+            model_quota_limiter=_QuotaLimiterStub(deny={"model-a"}),
+        )
+
+        routed = router.converse(
+            primary_model_id="model-a", route_set_name="rs1", messages=[], max_tokens=100, temperature=0.5
+        )
+
+        self.assertEqual(routed.model_id, "model-b")
+        self.assertTrue(routed.fallback)
+        called_models = {c["model_id"] for c in fake.calls}
+        self.assertNotIn("model-a", called_models)  # never attempted -- skipped before the call
+
+    def test_all_candidates_over_quota_raises_all_routes_unavailable(self):
+        fake = FakeConverseClient()
+        route_sets = {"rs1": RouteSet(name="rs1", primary="model-a", fallbacks=["model-b"])}
+        router = CertifiedRouter(
+            converse_client=fake, circuit_breaker=CircuitBreaker(), route_sets=route_sets,
+            certified_model_ids={"model-a", "model-b"},
+            model_quota_limiter=_QuotaLimiterStub(deny={"model-a", "model-b"}),
+        )
+
+        with self.assertRaises(AllRoutesUnavailableError):
+            router.converse(
+                primary_model_id="model-a", route_set_name="rs1", messages=[], max_tokens=100, temperature=0.5
+            )
+        self.assertEqual(len(fake.calls), 0)
+
+    def test_no_quota_limiter_configured_behaves_exactly_as_before(self):
+        """model_quota_limiter defaults to None -- every candidate is
+        gated by the breaker alone, unchanged from before this
+        feature existed."""
+        fake = FakeConverseClient()
+        router = CertifiedRouter(
+            converse_client=fake, circuit_breaker=CircuitBreaker(), route_sets={},
+            certified_model_ids={"model-a"},
+        )
+
+        routed = router.converse(
+            primary_model_id="model-a", route_set_name=None, messages=[], max_tokens=100, temperature=0.5
+        )
+
+        self.assertEqual(routed.model_id, "model-a")
+
     def test_no_route_set_configured_behaves_like_direct_call(self):
         fake = FakeConverseClient()
         router = CertifiedRouter(
@@ -223,6 +272,20 @@ class FailNTimesThenSucceed:
         return ConverseResult(
             text=f"response from {model_id}", input_tokens=1, output_tokens=1, stop_reason="end_turn", latency_ms=1.0
         )
+
+
+class _QuotaLimiterStub:
+    """Stands in for ModelQuotaLimiter -- denies exactly the model_ids
+    in `deny`, unconditionally and repeatedly (no token bucket to
+    exhaust), so a test can assert a specific candidate is skipped
+    without needing real DynamoDB/moto machinery (that's
+    test_model_quota.py's job)."""
+
+    def __init__(self, *, deny):
+        self._deny = set(deny)
+
+    def allow(self, model_id: str) -> bool:
+        return model_id not in self._deny
 
 
 class RoutingIntegrationTests(unittest.TestCase):

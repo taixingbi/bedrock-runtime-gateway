@@ -6,13 +6,16 @@
 # in the gateway's logs).
 #
 # Usage:
-#   ./scripts/smoke-test-iam.sh [role-arn] [message] [api-url]
+#   ./scripts/smoke-test-iam.sh [role-arn] [message] [api-url] [stream]
+#   ./scripts/smoke-test-iam.sh "" "Tell me a short story." "" true
 #
 #   role-arn  default: arn:aws:iam::646821141010:role/finance-manual-smoke-test
 #             (real monthly_budget, see policies/iam_tenants.yaml for
 #             every configured principal -> tenant mapping)
 #   message   default: "Say hi in one word."
 #   api-url   default: the dev IAM route
+#   stream    default: false; true requests SSE and disables curl buffering
+#             (upstream proxies may still buffer the response)
 #
 # For the dedicated-account isolation path (tenant-a/tenant-b, plan.md
 # section 29.2) this single assume-role isn't enough -- that needs a
@@ -24,6 +27,12 @@ set -euo pipefail
 ROLE_ARN="${1:-arn:aws:iam::646821141010:role/finance-manual-smoke-test}"
 MESSAGE="${2:-Say hi in one word.}"
 API_URL="${3:-https://as1n3q8d33.execute-api.us-east-1.amazonaws.com/iam/v1/chat}"
+STREAM="${4:-false}"
+case "$STREAM" in
+  true) CURL_BUFFERING=--no-buffer ;;
+  false) CURL_BUFFERING=--buffer ;;
+  *) echo "stream must be true or false" >&2; exit 2 ;;
+esac
 
 unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
 
@@ -45,11 +54,12 @@ echo "role=$ROLE_ARN"
 echo "request_id=$REQUEST_ID"
 echo "session_id=$SESSION_ID"
 echo "trace_id=$TRACE_ID"
+echo "stream=$STREAM"
 echo "---"
 
-BODY=$(MESSAGE="$MESSAGE" python3 -c "import json, os; print(json.dumps({'messages': [{'role': 'user', 'content': os.environ['MESSAGE']}]}))")
+BODY=$(MESSAGE="$MESSAGE" STREAM="$STREAM" python3 -c "import json, os; print(json.dumps({'messages': [{'role': 'user', 'content': os.environ['MESSAGE']}], 'stream': os.environ['STREAM'] == 'true'}))")
 
-curl -sS -i -X POST "$API_URL" \
+curl -sS -i "$CURL_BUFFERING" -X POST "$API_URL" \
   --aws-sigv4 "aws:amz:us-east-1:execute-api" \
   --user "$AWS_ACCESS_KEY_ID:$AWS_SECRET_ACCESS_KEY" \
   -H "x-amz-security-token: $AWS_SESSION_TOKEN" \

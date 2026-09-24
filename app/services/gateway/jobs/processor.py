@@ -23,6 +23,7 @@ from ..usage.store import record_provider_usage
 
 import dataclasses
 import json
+import time
 
 from .. import pipeline
 from ..guardrails.client import GuardrailClient
@@ -32,6 +33,7 @@ from ..policy.models import BLOCKING_STATES
 from ..routing.router import AllRoutesUnavailableError, CertifiedRouter
 from ..telemetry.cost import estimate_cost
 from ..telemetry.logging import get_logger, log_event
+from ..telemetry.metrics import emit_request_metric
 from ..usage.store import UsageStore
 from .models import JobNotFoundError, JobStatus
 from .store import JobStore
@@ -42,6 +44,7 @@ _logger = get_logger("gateway.worker")
 def process_one(
     message_body: str,
     *,
+    environment: str,
     job_store: JobStore,
     policy_cache: PolicySnapshotCache,
     guardrail_client: GuardrailClient,
@@ -68,6 +71,8 @@ def process_one(
             job, status=JobStatus.FAILED, error_code="TENANT_BLOCKED",
             error_message=f"tenant '{job.tenant_id}' is {policy.state.value}",
         ))
+        emit_request_metric(
+            environment=environment, tenant_id=job.tenant_id, reject_stage="kill_switch")
         return
 
 
@@ -77,13 +82,20 @@ def process_one(
     )
     if not token:
         job_store.finish(dataclasses.replace(job, status=JobStatus.QUEUED))
+        emit_request_metric(
+            environment=environment, tenant_id=job.tenant_id, reject_stage="concurrency")
         raise JobBusyError("inference capacity exhausted")
     with maintained_lease(limiter, job.tenant_id, token, priority_class=policy.priority_class):
         with heartbeat(lambda: job_store.renew(job)):
-            _execute(job, policy, job_store, guardrail_client, router, usage_store)
+            _execute(job, policy, job_store, guardrail_client, router, usage_store, environment)
 
 
-def _execute(job, policy, job_store, guardrail_client, router, usage_store):
+def _execute(job, policy, job_store, guardrail_client, router, usage_store, environment):
+    start = time.perf_counter()
+
+    def _e2e_ms() -> float:
+        return round((time.perf_counter() - start) * 1000, 2)
+
     messages = [BedrockChatMessage(role=m.role, text=m.content) for m in job.messages]
     try:
         routed = router.converse(
@@ -98,11 +110,15 @@ def _execute(job, policy, job_store, guardrail_client, router, usage_store):
         job_store.finish(dataclasses.replace(
             job, status=JobStatus.FAILED, error_code=exc.code, error_message=str(exc),
         ))
+        emit_request_metric(
+            environment=environment, tenant_id=job.tenant_id, model=job.model, e2e_latency_ms=_e2e_ms(), error=True)
         return
     except AllRoutesUnavailableError as exc:
         job_store.finish(dataclasses.replace(
             job, status=JobStatus.FAILED, error_code="ALL_ROUTES_UNAVAILABLE", error_message=str(exc),
         ))
+        emit_request_metric(
+            environment=environment, tenant_id=job.tenant_id, model=job.model, e2e_latency_ms=_e2e_ms(), error=True)
         return
 
     result = routed.result
@@ -117,6 +133,11 @@ def _execute(job, policy, job_store, guardrail_client, router, usage_store):
         job_store.finish(dataclasses.replace(
             job, status=JobStatus.FAILED, error_code=exc.code, error_message=str(exc),
         ))
+        emit_request_metric(
+            environment=environment,
+            tenant_id=job.tenant_id, model=routed.model_id, e2e_latency_ms=_e2e_ms(),
+            reject_stage="output_guardrail",
+        )
         return
 
     job_store.finish(dataclasses.replace(
@@ -129,4 +150,9 @@ def _execute(job, policy, job_store, guardrail_client, router, usage_store):
     log_event(
         _logger, "INFO", "job completed",
         job_id=job.job_id, tenant_id=job.tenant_id, model=routed.model_id, status=JobStatus.SUCCEEDED.value,
+    )
+    emit_request_metric(
+        environment=environment,
+        tenant_id=job.tenant_id, model=routed.model_id, e2e_latency_ms=_e2e_ms(),
+        estimated_cost_usd=estimated_cost,
     )

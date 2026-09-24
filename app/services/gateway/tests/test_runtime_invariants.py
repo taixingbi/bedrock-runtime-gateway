@@ -242,7 +242,7 @@ class WorkerOwnershipTests(unittest.TestCase):
         store.put(_job())
         fake = FakeConverseClient()
         with self.assertRaises(JobBusyError):
-            process_one('{"job_id":"job-1"}', job_store=store,
+            process_one('{"job_id":"job-1"}', environment='dev', job_store=store,
                 policy_cache=_policy_cache(finance=TenantPolicy(tenant_id='finance')),
                 guardrail_client=BasicGuardrailClient(), router=_router(fake),
                 usage_store=InMemoryUsageStore(), concurrency_limiter=limiter)
@@ -275,7 +275,7 @@ class CancellationTests(unittest.IsolatedAsyncioTestCase):
         async def consume():
             async for _ in stream_chat_response(chunks(), model_id='m', tenant_id='a', request_id='r',
                     circuit_breaker=CircuitBreaker(), is_disconnected=connected,
-                    on_complete=lambda final, status: completions.append(status)):
+                    on_complete=lambda final, status, ttft_ms, duration_ms: completions.append(status)):
                 pass
         task = asyncio.create_task(consume())
         await asyncio.to_thread(started.wait, 1)

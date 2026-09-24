@@ -47,6 +47,7 @@ from ..streaming import stream_chat_response
 from ..telemetry.cost import estimate_cost
 from ..telemetry.debug_capture import DebugCaptureStore, S3AuditStore
 from ..telemetry.logging import get_logger, log_event
+from ..telemetry.metrics import emit_request_metric
 from ..telemetry.otel import set_span_attributes
 from ..telemetry.request_audit import RequestAuditEvent, RequestAuditStore, current_trace_id
 from ..telemetry.slo import slo_breached
@@ -179,6 +180,16 @@ def build_router(
     async def _chat(request: Request, chat_request: ChatRequest):
         request_id = getattr(request.state, "request_id", str(uuid.uuid4()))
         session_id = getattr(request.state, "session_id", "")
+        # E2ELatencyMs's own clock -- covers the WHOLE request (auth,
+        # admission, guardrails, inference), unlike the pre-existing
+        # `start = time.perf_counter()` further down (only covers the
+        # Bedrock call itself, kept as-is for its own narrower log
+        # fields rather than widened and risking a behavior change to
+        # existing logs).
+        request_start = time.perf_counter()
+
+        def _e2e_ms() -> float:
+            return round((time.perf_counter() - request_start) * 1000, 2)
 
         with tracer.start_as_current_span("chat.request") as span:
             set_span_attributes(span, request_id=request_id, session_id=session_id or None)
@@ -243,6 +254,8 @@ def build_router(
                     request_id=request_id, tenant_id=identity.tenant_id,
                     stage=admission.stage, code=exc.code, priority_class=policy.priority_class,
                 )
+                emit_request_metric(
+                    environment=settings.environment,tenant_id=identity.tenant_id, reject_stage=admission.stage)
                 _write_audit(
                     request_id=request_id, identity=identity, action="chat.completion",
                     status=exc.status_code, policy_version=policy.policy_epoch,
@@ -319,6 +332,8 @@ def build_router(
                     tenant_id=identity.tenant_id, policy_epoch=policy.policy_epoch,
                     guardrail_latency_ms=guardrail_ms, error=str(exc),
                 )
+                emit_request_metric(
+                    environment=settings.environment,tenant_id=identity.tenant_id, model=model_id, error=True)
                 return _error(504, "UPSTREAM_TIMEOUT", str(exc), request_id)
             except pipeline.PipelineError as exc:
                 guardrail_ms = round((time.perf_counter() - guardrail_start) * 1000, 2)
@@ -342,6 +357,8 @@ def build_router(
                     decision_id=authz.decision_id,
                     guardrail_version=policy.guardrail_policy, guardrail_action="BLOCK",
                 )
+                emit_request_metric(
+                    environment=settings.environment,tenant_id=identity.tenant_id, model=model_id, reject_stage="input_guardrail")
                 return _error(exc.status_code, exc.code, str(exc), request_id)
             input_guardrail_ms = round((time.perf_counter() - guardrail_start) * 1000, 2)
 
@@ -357,6 +374,8 @@ def build_router(
                 # ends, and by then it's already been sent to the client).
                 if not circuit_breaker.allow(model_id):
                     set_span_attributes(span, status=503, error="circuit open")
+                    emit_request_metric(
+                    environment=settings.environment,tenant_id=identity.tenant_id, model=model_id, reject_stage="circuit_breaker")
                     return _error(
                         503, "UPSTREAM_UNAVAILABLE",
                         f"model '{model_id}' is temporarily unavailable (circuit open)",
@@ -368,6 +387,8 @@ def build_router(
                 # check treatment as circuit_breaker.allow() just above.
                 if model_quota_limiter is not None and not model_quota_limiter.allow(model_id, identity.tenant_id):
                     set_span_attributes(span, status=503, error="over model quota")
+                    emit_request_metric(
+                    environment=settings.environment,tenant_id=identity.tenant_id, model=model_id, reject_stage="model_quota")
                     return _error(
                         503, "UPSTREAM_UNAVAILABLE",
                         f"model '{model_id}' is temporarily unavailable (over its AWS quota budget)",
@@ -396,7 +417,8 @@ def build_router(
                             close = getattr(chunks, "close", None)
                             if close:
                                 close()
-                def complete_stream(final, status):
+                def complete_stream(final, status, ttft_ms, duration_ms):
+                    cost = None
                     try:
                         if final is not None and final.input_tokens is not None and final.output_tokens is not None:
                             cost = estimate_cost(model_id, input_tokens=final.input_tokens, output_tokens=final.output_tokens)
@@ -406,6 +428,12 @@ def build_router(
                                          estimated_cost=cost)
                     finally:
                         _finalize(audit, status)
+                        emit_request_metric(
+                    environment=settings.environment,
+                            tenant_id=identity.tenant_id, model=model_id,
+                            e2e_latency_ms=duration_ms, ttft_ms=ttft_ms, estimated_cost_usd=cost,
+                            error=status >= 400 and status != 499,
+                        )
                 chunk_iter = stream_chunks()
                 set_span_attributes(span, status=200, stream=True)
                 return StreamingResponse(
@@ -476,6 +504,11 @@ def build_router(
                     input_tokens=cached.input_tokens, output_tokens=cached.output_tokens,
                     estimated_cost=estimated_cost,
                 )
+                emit_request_metric(
+                    environment=settings.environment,
+                    tenant_id=identity.tenant_id, model=cached.model_id,
+                    e2e_latency_ms=0.0, estimated_cost_usd=estimated_cost,
+                )
                 response = ChatResponse(
                     request_id=request_id,
                     model=cached.model_id,
@@ -518,6 +551,11 @@ def build_router(
                     latency_ms=round((time.perf_counter() - start) * 1000, 2),
                     error=str(exc),
                 )
+                emit_request_metric(
+                    environment=settings.environment,
+                    tenant_id=identity.tenant_id, model=model_id,
+                    e2e_latency_ms=_e2e_ms(), error=True,
+                )
                 return _error(status_code, error_code, str(exc), request_id)
             except AllRoutesUnavailableError as exc:
                 set_span_attributes(span, status=503, error=str(exc))
@@ -527,6 +565,11 @@ def build_router(
                     tenant_id=identity.tenant_id, policy_epoch=policy.policy_epoch,
                     latency_ms=round((time.perf_counter() - start) * 1000, 2),
                     error=str(exc),
+                )
+                emit_request_metric(
+                    environment=settings.environment,
+                    tenant_id=identity.tenant_id, model=model_id,
+                    e2e_latency_ms=_e2e_ms(), error=True,
                 )
                 return _error(503, "ALL_ROUTES_UNAVAILABLE", str(exc), request_id)
             except BlockingCallTimeoutError as exc:
@@ -538,6 +581,11 @@ def build_router(
                     latency_ms=round((time.perf_counter() - start) * 1000, 2),
                     error=str(exc),
                 )
+                emit_request_metric(
+                    environment=settings.environment,
+                    tenant_id=identity.tenant_id, model=model_id,
+                    e2e_latency_ms=_e2e_ms(), error=True,
+                )
                 return _error(504, "UPSTREAM_TIMEOUT", str(exc), request_id)
             except pipeline.PipelineError as exc:
                 set_span_attributes(span, status=exc.status_code, error=str(exc))
@@ -547,6 +595,16 @@ def build_router(
                     tenant_id=identity.tenant_id, policy_epoch=policy.policy_epoch,
                     latency_ms=round((time.perf_counter() - start) * 1000, 2),
                     error=str(exc),
+                )
+                # CONCURRENCY_LIMIT_EXCEEDED is admission control, not a
+                # downstream failure -- reject_stage, not ErrorCount.
+                is_concurrency_reject = exc.code == "CONCURRENCY_LIMIT_EXCEEDED"
+                emit_request_metric(
+                    environment=settings.environment,
+                    tenant_id=identity.tenant_id, model=model_id,
+                    e2e_latency_ms=_e2e_ms(),
+                    error=not is_concurrency_reject,
+                    reject_stage="concurrency" if is_concurrency_reject else None,
                 )
                 return _error(exc.status_code, exc.code, str(exc), request_id)
 
@@ -575,6 +633,8 @@ def build_router(
                     guardrail_latency_ms=round(input_guardrail_ms + output_guardrail_ms, 2),
                     error=str(exc),
                 )
+                emit_request_metric(
+                    environment=settings.environment,tenant_id=identity.tenant_id, model=routed.model_id, e2e_latency_ms=_e2e_ms(), error=True)
                 return _error(504, "UPSTREAM_TIMEOUT", str(exc), request_id)
             except pipeline.PipelineError as exc:
                 audit.update(guardrail_action="BLOCK", guardrail_version=policy.guardrail_policy)
@@ -592,6 +652,11 @@ def build_router(
                     guardrail_version=policy.guardrail_policy, guardrail_action="BLOCK",
                     guardrail_latency_ms=round(input_guardrail_ms + output_guardrail_ms, 2),
                     blocked_reason=str(exc), error=str(exc),
+                )
+                emit_request_metric(
+                    environment=settings.environment,
+                    tenant_id=identity.tenant_id, model=routed.model_id, e2e_latency_ms=_e2e_ms(),
+                    reject_stage="output_guardrail",
                 )
                 return _error(exc.status_code, exc.code, str(exc), request_id)
             output_guardrail_ms = round((time.perf_counter() - guardrail_start) * 1000, 2)
@@ -665,6 +730,11 @@ def build_router(
                 guardrail_version=policy.guardrail_policy, guardrail_action="ALLOW",
                 input_tokens=result.input_tokens, output_tokens=result.output_tokens,
                 estimated_cost=estimated_cost,
+            )
+            emit_request_metric(
+                    environment=settings.environment,
+                tenant_id=identity.tenant_id, model=routed.model_id,
+                e2e_latency_ms=_e2e_ms(), estimated_cost_usd=estimated_cost,
             )
 
             response = ChatResponse(

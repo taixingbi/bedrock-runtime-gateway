@@ -16,6 +16,20 @@ locals {
   name_prefix = "gateway-prod"
 }
 
+# See environments/dev/main.tf's own copy of this resource for the
+# design note. Prod never had this topic at all until now (its
+# ecs_service module call also never passes sns_topic_arn, so THOSE
+# alarms -- p95_latency/unhealthy_hosts/target_5xx -- have no
+# notification target either; a real, separate, pre-existing gap this
+# doesn't fix, flagged rather than silently expanded into here).
+resource "aws_sns_topic" "ops_alerts" {
+  name = "${local.name_prefix}-ops-alerts"
+
+  tags = {
+    Environment = "prod"
+  }
+}
+
 module "network" {
   source = "../../modules/network"
 

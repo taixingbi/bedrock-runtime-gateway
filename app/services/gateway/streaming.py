@@ -49,6 +49,12 @@ async def stream_chat_response(
     aborted = False
     final: Optional[StreamChunk] = None
     start = time.perf_counter()
+    # Time-to-first-token: set once, on the first chunk that actually
+    # carries visible text -- distinct from e2e latency (this can be
+    # much smaller than the full stream duration), and the one real
+    # TTFT measurement in this whole codebase (see telemetry/metrics.py
+    # module docstring for why it's otherwise never computed).
+    ttft_ms: Optional[float] = None
 
     status = 200
     sentinel = object()
@@ -76,6 +82,8 @@ async def stream_chat_response(
                 aborted = True
                 break
             if chunk.text_delta:
+                if ttft_ms is None:
+                    ttft_ms = round((time.perf_counter() - start) * 1000, 2)
                 generated_chunks += 1
                 yield _sse(data={"delta": chunk.text_delta})
             if chunk.is_final:
@@ -110,7 +118,8 @@ async def stream_chat_response(
                     await asyncio.to_thread(close)
             finally:
                 if on_complete is not None:
-                    await asyncio.to_thread(on_complete, final, status)
+                    cleanup_duration_ms = round((time.perf_counter() - start) * 1000, 2)
+                    await asyncio.to_thread(on_complete, final, status, ttft_ms, cleanup_duration_ms)
         cleanup_task = asyncio.create_task(cleanup())
         await asyncio.shield(cleanup_task)
 
@@ -134,7 +143,7 @@ async def stream_chat_response(
         _logger, "INFO", "chat stream completed",
         request_id=request_id, model=model_id, tenant_id=tenant_id,
         client_disconnected=aborted, generated_chunks=generated_chunks,
-        stream_duration_ms=duration_ms, status=status,
+        ttft_ms=ttft_ms, stream_duration_ms=duration_ms, status=status,
     )
 
 

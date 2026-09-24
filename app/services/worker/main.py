@@ -132,6 +132,7 @@ def main() -> None:
     run_forever(
         sqs_client=sqs_client,
         queue_url=settings.jobs_queue_url,
+        environment=settings.environment,
         job_store=job_store,
         policy_cache=policy_cache,
         guardrail_client=guardrail_client,

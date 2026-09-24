@@ -148,6 +148,11 @@ data "aws_iam_policy_document" "infra_plan" {
       "secretsmanager:GetResourcePolicy",
       "application-autoscaling:Describe*", "application-autoscaling:ListTagsForResource",
       "cloudwatch:Describe*", "cloudwatch:List*", "cloudwatch:Get*",
+      # Amazon Managed Grafana (infra/environments/dev/grafana.tf) --
+      # refreshing aws_grafana_workspace/aws_grafana_role_association
+      # state calls DescribeWorkspace/ListWorkspaces and the role
+      # associations' own List/Describe actions.
+      "grafana:Describe*", "grafana:List*", "grafana:Get*",
       "sns:GetTopicAttributes", "sns:ListTagsForResource", "sns:ListTopics",
       "kms:DescribeKey", "kms:GetKeyPolicy", "kms:GetKeyRotationStatus",
       "kms:ListResourceTags", "kms:ListAliases",
@@ -213,6 +218,14 @@ data "aws_iam_policy_document" "infra_apply" {
   statement {
     sid       = "CloudFrontBroad"
     actions   = ["cloudfront:*"]
+    resources = ["*"]
+  }
+  # Amazon Managed Grafana (infra/environments/dev/grafana.tf) --
+  # workspace ids (g-xxxxxxxxxx) don't exist until creation, same
+  # reasoning as every other broad grant here.
+  statement {
+    sid       = "GrafanaBroad"
+    actions   = ["grafana:*"]
     resources = ["*"]
   }
   # Internal TLS (gateway-api <-> authz-service): creating/activating

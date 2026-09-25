@@ -38,12 +38,21 @@ resource "aws_grafana_workspace" "gateway" {
 
   account_access_type      = "CURRENT_ACCOUNT"
   authentication_providers = ["AWS_SSO"]
-  # SERVICE_MANAGED: AWS attaches/maintains the IAM policy this role
-  # needs for the data_sources listed below -- this repo doesn't have
-  # to hand-maintain a CloudWatch-read policy itself.
+  # SERVICE_MANAGED here only means "AWS doesn't require you to scope
+  # the policy down yourself" -- it does NOT actually auto-attach
+  # anything to role_arn. Live-verified: after apply, aws_iam_role.
+  # grafana had zero attached/inline policies, and the CloudWatch
+  # datasource 403'd on cloudwatch:ListMetrics until the policy below
+  # was attached explicitly. The aws_iam_role_policy_attachment is
+  # what actually grants access, not this argument.
   permission_type = "SERVICE_MANAGED"
   data_sources    = ["CLOUDWATCH"]
   role_arn        = aws_iam_role.grafana.arn
+}
+
+resource "aws_iam_role_policy_attachment" "grafana_cloudwatch" {
+  role       = aws_iam_role.grafana.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonGrafanaCloudWatchAccess"
 }
 
 resource "aws_grafana_role_association" "admin" {
@@ -59,5 +68,5 @@ resource "aws_grafana_role_association" "admin" {
 
 output "grafana_workspace_url" {
   value       = "https://${aws_grafana_workspace.gateway.id}.grafana-workspace.${var.aws_region}.amazonaws.com"
-  description = "Sign in via AWS SSO (IAM Identity Center) -- add the BedrockGateway CloudWatch namespace as a data source panel source once signed in (CLOUDWATCH data source is pre-provisioned by permission_type=SERVICE_MANAGED, but individual dashboards/panels are still created by hand in the Grafana UI, not by Terraform)."
+  description = "Sign in via AWS SSO (IAM Identity Center). The CloudWatch datasource and the BedrockGateway dashboard are provisioned by ./grafana/provision.sh (run it after every `terraform apply` here, or after any dashboard.json edit) -- not by Terraform itself, since the AWS provider has no dashboard/datasource resource for Grafana (see that script's own docstring)."
 }

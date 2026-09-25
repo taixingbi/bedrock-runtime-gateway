@@ -155,13 +155,18 @@ data "aws_iam_policy_document" "infra_plan" {
       "grafana:Describe*", "grafana:List*", "grafana:Get*",
       # Refreshing aws_grafana_role_association's state (AWS_SSO auth)
       # calls grafana:ListPermissions, which under the hood resolves
-      # the workspace's SSO-managed application -- needs these SSO/
-      # Identity Store reads too, or ListPermissions itself 403s with
-      # "Unable to list users from managed application" even though
-      # the caller has grafana:List* -- live-verified in this exact CI
-      # run, not guessed ahead of time.
-      "sso:DescribeRegisteredRegions", "sso:GetManagedApplicationInstance", "sso:ListDirectoryAssociations",
-      "identitystore:DescribeUser", "identitystore:DescribeGroup", "identitystore:ListUsers", "identitystore:ListGroups",
+      # the workspace's SSO-managed application -- needs these SSO
+      # reads too, or ListPermissions itself 403s with "Unable to list
+      # users from managed application" even with grafana:List*
+      # already granted. Exact action list copied from AWS's own
+      # managed policy (AWSGrafanaWorkspacePermissionManagementV2) --
+      # a first guess using identitystore:* actions instead of
+      # sso-directory:* (the actual, older API namespace Grafana calls
+      # here) 403'd live in CI the same way; verified against that
+      # managed policy's real document, not guessed a second time.
+      "sso:DescribeRegisteredRegions", "sso:GetSharedSsoConfiguration", "sso:ListDirectoryAssociations",
+      "sso:GetManagedApplicationInstance", "sso:ListProfiles", "sso:GetProfile", "sso:ListProfileAssociations",
+      "sso-directory:DescribeUser", "sso-directory:DescribeGroup",
       "sns:GetTopicAttributes", "sns:ListTagsForResource", "sns:ListTopics",
       "kms:DescribeKey", "kms:GetKeyPolicy", "kms:GetKeyRotationStatus",
       "kms:ListResourceTags", "kms:ListAliases",
@@ -246,8 +251,9 @@ data "aws_iam_policy_document" "infra_apply" {
   statement {
     sid = "GrafanaSsoLookup"
     actions = [
-      "sso:DescribeRegisteredRegions", "sso:GetManagedApplicationInstance", "sso:ListDirectoryAssociations",
-      "identitystore:DescribeUser", "identitystore:DescribeGroup", "identitystore:ListUsers", "identitystore:ListGroups",
+      "sso:DescribeRegisteredRegions", "sso:GetSharedSsoConfiguration", "sso:ListDirectoryAssociations",
+      "sso:GetManagedApplicationInstance", "sso:ListProfiles", "sso:GetProfile", "sso:ListProfileAssociations",
+      "sso-directory:DescribeUser", "sso-directory:DescribeGroup",
     ]
     resources = ["*"]
   }

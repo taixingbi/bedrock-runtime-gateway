@@ -158,6 +158,23 @@ class Settings:
     # "purely ephemeral counters" shape admission_control_table_name's
     # rows do.
     model_quotas_table_name: str
+    # A SEPARATE table from model_quotas_table_name above, deliberately
+    # -- ModelQuotaLimiter's own live rate-limit counter rows
+    # ("ratelimit#model#<id>", "ratelimit#model_tenant#<id>#<tenant>",
+    # and their _tpm variants) used to live in model_quotas_table_name
+    # alongside the out-of-band quota# config rows, on the theory that
+    # one table was simpler than two. In practice that meant
+    # model_quotas_table_name -- the one place an operator expects to
+    # see ONLY config synced by scripts/sync_model_quotas_from_aws.py
+    # -- filled up with live counter rows too, confusing at a glance
+    # and mixing a table that deliberately has PITR enabled (the config
+    # is worth restoring) with rows that are pure, harmless-to-lose
+    # ephemeral counters (same shape as admission_control_table_name's
+    # rows, which correctly have no PITR at all). Split out so
+    # model_quotas_table_name is provably quota-config-only again.
+    # Empty means the same as model_quotas_table_name being empty: no
+    # per-model AWS-quota gate at all.
+    model_ratelimits_table_name: str
     # routing/model_quota.py's per-tenant fair-share sub-cap: a single
     # tenant may never consume more than this fraction of a shared
     # model's own rpm_limit, on top of (not instead of) the overall
@@ -283,6 +300,7 @@ def load_settings() -> Settings:
         blocking_call_timeout_s=_env_float("BLOCKING_CALL_TIMEOUT_S", 60.0),
         admission_control_table_name=os.environ.get("ADMISSION_CONTROL_TABLE_NAME", ""),
         model_quotas_table_name=os.environ.get("MODEL_QUOTAS_TABLE_NAME", ""),
+        model_ratelimits_table_name=os.environ.get("MODEL_RATELIMITS_TABLE_NAME", ""),
         model_quota_per_tenant_share_pct=_env_float("MODEL_QUOTA_PER_TENANT_SHARE_PCT", 0.4),
         concurrency_lease_ttl_s=_env_float("CONCURRENCY_LEASE_TTL_S", 300.0),
         jobs_queue_url=os.environ.get("JOBS_QUEUE_URL", ""),

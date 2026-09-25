@@ -135,12 +135,17 @@ variable "tenant_policies_table_arn" {
 variable "admission_control_table_arn" {
   type = string
 }
-# routing/model_quota.py's ModelQuotaLimiter -- the same table/gate
-# gateway-api's own ecs_service module uses (var.model_quotas_table_arn
+# routing/model_quota.py's ModelQuotaCache -- the same table gateway-api's
+# own ecs_service module uses (var.model_quotas_table_arn there).
+variable "model_quotas_table_arn" {
+  type = string
+}
+# ModelQuotaLimiter's own live rate-limit counters -- the same table
+# gateway-api's own ecs_service module uses (var.model_ratelimits_table_arn
 # there), coordinating through the same real DynamoDB counter since
 # Bedrock's account-wide quota is shared between synchronous /v1/chat
 # traffic and this worker's async job traffic.
-variable "model_quotas_table_arn" {
+variable "model_ratelimits_table_arn" {
   type = string
 }
 variable "guardrail_arn" {

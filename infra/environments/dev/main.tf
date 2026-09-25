@@ -183,6 +183,7 @@ module "ecs_service" {
   usage_table_arn             = aws_dynamodb_table.usage.arn
   admission_control_table_arn = aws_dynamodb_table.admission_control.arn
   model_quotas_table_arn      = aws_dynamodb_table.model_quotas.arn
+  model_ratelimits_table_arn  = aws_dynamodb_table.model_ratelimits.arn
   audit_bucket_arn            = aws_s3_bucket.audit.arn
   audit_kms_key_arn           = aws_kms_key.audit.arn
   request_audit_bucket_arn    = aws_s3_bucket.request_audit.arn
@@ -212,6 +213,7 @@ module "ecs_service" {
     USAGE_TABLE_NAME             = aws_dynamodb_table.usage.name
     ADMISSION_CONTROL_TABLE_NAME = aws_dynamodb_table.admission_control.name
     MODEL_QUOTAS_TABLE_NAME      = aws_dynamodb_table.model_quotas.name
+    MODEL_RATELIMITS_TABLE_NAME  = aws_dynamodb_table.model_ratelimits.name
     AUDIT_BUCKET_NAME            = aws_s3_bucket.audit.id
     REQUEST_AUDIT_BUCKET_NAME    = aws_s3_bucket.request_audit.id
     BEDROCK_GUARDRAIL_ID         = aws_bedrock_guardrail.this.guardrail_id
@@ -676,6 +678,33 @@ resource "aws_dynamodb_table" "model_quotas" {
   }
 }
 
+# Split out from model_quotas above (2026-09-25) -- ModelQuotaLimiter's
+# own live rate-limit counter rows ("ratelimit#model#<id>",
+# "ratelimit#model_tenant#<id>#<tenant>", and their _tpm variants) used
+# to live in model_quotas alongside its out-of-band quota# config rows.
+# In practice that meant the one table an operator expects to hold
+# ONLY what scripts/sync_model_quotas_from_aws.py synced kept filling
+# up with live counter rows instead -- caught by hand in the DynamoDB
+# console, not a design anyone intended going in. Deliberately NO
+# point_in_time_recovery here (unlike model_quotas above): these rows
+# are pure, harmless-to-lose ephemeral counters, same shape as
+# admission_control's rows just above, which correctly have no PITR
+# either.
+resource "aws_dynamodb_table" "model_ratelimits" {
+  name         = "gateway-model-ratelimits-dev"
+  billing_mode = "PAY_PER_REQUEST"
+  hash_key     = "pk"
+
+  attribute {
+    name = "pk"
+    type = "S"
+  }
+
+  tags = {
+    Environment = "dev"
+  }
+}
+
 # --- M11: Application Onboarding (plan section 22) -------------------------
 
 resource "aws_dynamodb_table" "onboarding_requests" {
@@ -884,12 +913,14 @@ module "worker_service" {
   tenant_policies_table_arn   = aws_dynamodb_table.provisioned_tenant_policies.arn
   admission_control_table_arn = aws_dynamodb_table.admission_control.arn
   model_quotas_table_arn      = aws_dynamodb_table.model_quotas.arn
+  model_ratelimits_table_arn  = aws_dynamodb_table.model_ratelimits.arn
   guardrail_arn               = aws_bedrock_guardrail.this.guardrail_arn
 
   container_env = {
     PROVISIONED_TENANT_POLICIES_TABLE_NAME = aws_dynamodb_table.provisioned_tenant_policies.name
     ADMISSION_CONTROL_TABLE_NAME           = aws_dynamodb_table.admission_control.name
     MODEL_QUOTAS_TABLE_NAME                = aws_dynamodb_table.model_quotas.name
+    MODEL_RATELIMITS_TABLE_NAME            = aws_dynamodb_table.model_ratelimits.name
     BEDROCK_GUARDRAIL_ID                   = aws_bedrock_guardrail.this.guardrail_id
     BEDROCK_GUARDRAIL_VERSION              = aws_bedrock_guardrail_version.v1.version
     AWS_REGION                             = var.aws_region

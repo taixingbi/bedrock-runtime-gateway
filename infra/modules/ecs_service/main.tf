@@ -441,24 +441,26 @@ resource "aws_iam_role_policy" "task_policy_versioning" {
   policy = data.aws_iam_policy_document.policy_versioning_access.json
 }
 
-# routing/model_quota.py's ModelQuotaLimiter/ModelQuotaCache -- two
-# rows per model_id in this table: "quota#<model_id>" (config,
-# GetItem-only from gateway-api's side, written only by
-# scripts/sync_model_quotas_from_aws.py running out-of-band) and
-# "ratelimit#model#<model_id>" (DynamoDbRateLimiter's own live CAS
-# counter, needs the same actions its tenant-scoped sibling already
-# has on admission_control_table_arn above).
+# routing/model_quota.py's ModelQuotaCache -- "quota#<model_id>" rows,
+# config written only by scripts/sync_model_quotas_from_aws.py running
+# out-of-band. GetItem-only: gateway-api only ever reads this table.
+#
+# ModelQuotaLimiter's own live rate-limit counter rows
+# ("ratelimit#model#<model_id>" and its _tenant/_tpm variants) live in
+# a SEPARATE table (model_ratelimits_table_arn) -- needs the same
+# actions its tenant-scoped sibling already has on
+# admission_control_table_arn above (GetItem for the read-before-CAS,
+# PutItem for the CAS write itself).
 data "aws_iam_policy_document" "model_quota_access" {
   statement {
-    sid = "ModelQuota"
-    # GetItem covers both rows (config read + counter read-before-CAS);
-    # PutItem is only ever issued by DynamoDbRateLimiter's own CAS
-    # write against the counter row -- gateway-api never PutItems the
-    # config row itself, but IAM has no per-row-prefix distinction to
-    # express that narrower intent without a LeadingKeys condition this
-    # table doesn't otherwise need.
-    actions   = ["dynamodb:GetItem", "dynamodb:PutItem"]
+    sid       = "ModelQuotaConfig"
+    actions   = ["dynamodb:GetItem"]
     resources = [var.model_quotas_table_arn]
+  }
+  statement {
+    sid       = "ModelRateLimitCounters"
+    actions   = ["dynamodb:GetItem", "dynamodb:PutItem"]
+    resources = [var.model_ratelimits_table_arn]
   }
 }
 

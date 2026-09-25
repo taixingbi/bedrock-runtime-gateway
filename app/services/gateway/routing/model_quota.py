@@ -29,8 +29,9 @@ it does not replace that reactive path, which still covers any drift
 between what this gate believes the quota is and Bedrock's live truth.
 
 Two independently swappable pieces, deliberately reading/writing two
-different rows per model_id in the same table rather than one shared
-row:
+SEPARATE tables (not two rows in one table -- see config.py's own note
+on why gateway-model-quotas-dev and gateway-model-ratelimits-dev were
+split apart):
   - ModelQuotaCache -- reads gateway-model-quotas-dev's rpm_limit from
     the "quota#<model_id>" row (config: rpm_limit/quota_type/
     updated_at, written only by the sync script), TTL-cached (default
@@ -39,16 +40,13 @@ row:
     re-runs the sync script", not per request.
   - ModelQuotaLimiter -- wraps a DynamoDbRateLimiter instance (the
     exact same CAS token-bucket class tenants use for rate limiting,
-    policy/rate_limiter.py, pointed at this table via
+    policy/rate_limiter.py, pointed at gateway-model-ratelimits-dev via
     key_prefix="ratelimit#model#") with the cache above, so the only
-    thing routing/router.py calls is allow(model_id) -> bool.
-    DynamoDbRateLimiter.allow() treats "item exists" as "this bucket
-    has tokens/last_refill_ms already" -- sharing its row with the
-    sync script's config write would violate that the first time a
-    model's quota is synced before its bucket is ever touched, so its
-    "ratelimit#model#<model_id>" row is counter-only, never written by
-    anything except DynamoDbRateLimiter itself, exactly like every
-    tenant's own row.
+    thing routing/router.py calls is allow(model_id) -> bool. Living in
+    a table the sync script never touches at all (rather than merely a
+    differently-prefixed row in the same table) means there's no longer
+    even a theoretical chance of a counter row colliding with a config
+    write -- gateway-model-quotas-dev is now provably quota-config-only.
 
 Fails OPEN, not closed, on an unknown model (no synced row): a missing
 AWS-quota row is a data-freshness gap (the sync script never ran, or

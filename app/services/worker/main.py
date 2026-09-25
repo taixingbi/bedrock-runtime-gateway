@@ -99,25 +99,28 @@ def main() -> None:
     model_quota_limiter = (
         ModelQuotaLimiter(
             cache=ModelQuotaCache(table_name=settings.model_quotas_table_name, region=settings.aws_region),
+            # Live counters live in model_ratelimits_table_name, a
+            # SEPARATE table from the cache's quota-config table above
+            # -- see config.py's own note on why this split exists.
             limiter=DynamoDbRateLimiter(
-                table_name=settings.model_quotas_table_name, region=settings.aws_region,
+                table_name=settings.model_ratelimits_table_name, region=settings.aws_region,
                 key_prefix="ratelimit#model#",
             ),
             tenant_limiter=DynamoDbRateLimiter(
-                table_name=settings.model_quotas_table_name, region=settings.aws_region,
+                table_name=settings.model_ratelimits_table_name, region=settings.aws_region,
                 key_prefix="ratelimit#model_tenant#",
             ),
             per_tenant_share_pct=settings.model_quota_per_tenant_share_pct,
             tpm_limiter=DynamoDbRateLimiter(
-                table_name=settings.model_quotas_table_name, region=settings.aws_region,
+                table_name=settings.model_ratelimits_table_name, region=settings.aws_region,
                 key_prefix="ratelimit#model_tpm#",
             ),
             tenant_tpm_limiter=DynamoDbRateLimiter(
-                table_name=settings.model_quotas_table_name, region=settings.aws_region,
+                table_name=settings.model_ratelimits_table_name, region=settings.aws_region,
                 key_prefix="ratelimit#model_tenant_tpm#",
             ),
         )
-        if settings.model_quotas_table_name
+        if settings.model_quotas_table_name and settings.model_ratelimits_table_name
         else None
     )
     router = CertifiedRouter(

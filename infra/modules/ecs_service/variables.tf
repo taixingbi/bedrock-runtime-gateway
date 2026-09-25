@@ -203,15 +203,23 @@ variable "admission_control_table_arn" {
   type = string
 }
 
-# routing/model_quota.py -- per-model AWS Bedrock quota (rpm_limit)
-# pulled from AWS Service Quotas by scripts/sync_model_quotas_from_aws.py,
-# plus DynamoDbRateLimiter's own live counter for enforcing it. A
-# separate table from admission_control_table_arn above (not "one
-# table, no reason to provision two" like that one) because this
-# table's config rows are written out-of-band by that sync script, not
-# just live request-time counters -- see config.py's own note on this
-# distinction.
+# routing/model_quota.py -- per-model AWS Bedrock quota (rpm_limit/
+# tpm_limit) pulled from AWS Service Quotas by
+# scripts/sync_model_quotas_from_aws.py. A separate table from
+# admission_control_table_arn above (not "one table, no reason to
+# provision two" like that one) because this table's rows are written
+# out-of-band by that sync script, not just live request-time
+# counters -- see config.py's own note on this distinction.
 variable "model_quotas_table_arn" {
+  type = string
+}
+
+# ModelQuotaLimiter's own live rate-limit counter rows (DynamoDbRateLimiter's
+# CAS token buckets, same class tenants use) -- a SEPARATE table from
+# model_quotas_table_arn above, not a differently-prefixed row in it (see
+# config.py's own note on why: keeps model_quotas_table_arn provably
+# quota-config-only, never mixed with live counters).
+variable "model_ratelimits_table_arn" {
   type = string
 }
 

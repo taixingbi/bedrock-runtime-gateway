@@ -153,6 +153,15 @@ data "aws_iam_policy_document" "infra_plan" {
       # state calls DescribeWorkspace/ListWorkspaces and the role
       # associations' own List/Describe actions.
       "grafana:Describe*", "grafana:List*", "grafana:Get*",
+      # Refreshing aws_grafana_role_association's state (AWS_SSO auth)
+      # calls grafana:ListPermissions, which under the hood resolves
+      # the workspace's SSO-managed application -- needs these SSO/
+      # Identity Store reads too, or ListPermissions itself 403s with
+      # "Unable to list users from managed application" even though
+      # the caller has grafana:List* -- live-verified in this exact CI
+      # run, not guessed ahead of time.
+      "sso:DescribeRegisteredRegions", "sso:GetManagedApplicationInstance", "sso:ListDirectoryAssociations",
+      "identitystore:DescribeUser", "identitystore:DescribeGroup", "identitystore:ListUsers", "identitystore:ListGroups",
       "sns:GetTopicAttributes", "sns:ListTagsForResource", "sns:ListTopics",
       "kms:DescribeKey", "kms:GetKeyPolicy", "kms:GetKeyRotationStatus",
       "kms:ListResourceTags", "kms:ListAliases",
@@ -226,6 +235,20 @@ data "aws_iam_policy_document" "infra_apply" {
   statement {
     sid       = "GrafanaBroad"
     actions   = ["grafana:*"]
+    resources = ["*"]
+  }
+  # See infra_plan's identical comment above -- aws_grafana_role_
+  # association (AWS_SSO auth) needs these to resolve the workspace's
+  # SSO-managed application, or grafana:ListPermissions/
+  # UpdatePermissions 403 even with grafana:* already granted. This
+  # apply-side role doesn't inherit infra_plan's statements, so it
+  # needs its own copy of the same actions.
+  statement {
+    sid = "GrafanaSsoLookup"
+    actions = [
+      "sso:DescribeRegisteredRegions", "sso:GetManagedApplicationInstance", "sso:ListDirectoryAssociations",
+      "identitystore:DescribeUser", "identitystore:DescribeGroup", "identitystore:ListUsers", "identitystore:ListGroups",
+    ]
     resources = ["*"]
   }
   # Internal TLS (gateway-api <-> authz-service): creating/activating

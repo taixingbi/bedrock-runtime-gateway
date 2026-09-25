@@ -376,8 +376,17 @@ def build_router(
                     set_span_attributes(span, status=503, error="circuit open")
                     emit_request_metric(
                     environment=settings.environment,tenant_id=identity.tenant_id, model=model_id, reject_stage="circuit_breaker")
+                    # CIRCUIT_OPEN, not UPSTREAM_UNAVAILABLE: this is the
+                    # gateway proactively skipping a call, not a real
+                    # Bedrock failure -- the non-streaming path's real
+                    # ServiceUnavailableException maps to UPSTREAM_UNAVAILABLE
+                    # too (see _ERROR_STATUS_MAP below), and until this fix
+                    # both cases were indistinguishable on the wire, which
+                    # defeats any external client's (e.g. an eval/load-test
+                    # harness) ability to tell "gateway shed this" from
+                    # "Bedrock itself failed."
                     return _error(
-                        503, "UPSTREAM_UNAVAILABLE",
+                        503, "CIRCUIT_OPEN",
                         f"model '{model_id}' is temporarily unavailable (circuit open)",
                         request_id,
                     )
@@ -389,8 +398,11 @@ def build_router(
                     set_span_attributes(span, status=503, error="over model quota")
                     emit_request_metric(
                     environment=settings.environment,tenant_id=identity.tenant_id, model=model_id, reject_stage="model_quota")
+                    # MODEL_QUOTA_EXCEEDED, not UPSTREAM_UNAVAILABLE -- see
+                    # the CIRCUIT_OPEN comment just above for why this
+                    # distinction matters on the wire, not just internally.
                     return _error(
-                        503, "UPSTREAM_UNAVAILABLE",
+                        503, "MODEL_QUOTA_EXCEEDED",
                         f"model '{model_id}' is temporarily unavailable (over its AWS quota budget)",
                         request_id,
                     )

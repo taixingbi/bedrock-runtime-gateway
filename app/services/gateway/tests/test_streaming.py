@@ -176,7 +176,10 @@ class StreamingIntegrationTests(unittest.TestCase):
         )
 
         self.assertEqual(resp.status_code, 503)
-        self.assertEqual(resp.json()["error"]["code"], "UPSTREAM_UNAVAILABLE")
+        # CIRCUIT_OPEN, not UPSTREAM_UNAVAILABLE -- distinguishes a
+        # proactive gateway skip from a real Bedrock failure on the wire
+        # (see routes.py's own comment at this reject site).
+        self.assertEqual(resp.json()["error"]["code"], "CIRCUIT_OPEN")
         self.assertEqual(len(fake.stream_calls), 0)  # never even attempted
 
 

@@ -3,114 +3,510 @@
     "id": null,
     "uid": "bedrock-gateway-dev",
     "title": "Bedrock Gateway (dev)",
-    "tags": ["bedrock-gateway", "dev"],
+    "tags": [
+      "bedrock-gateway",
+      "dev"
+    ],
     "timezone": "browser",
     "schemaVersion": 39,
     "version": 1,
     "refresh": "1m",
-    "time": { "from": "now-3h", "to": "now" },
+    "time": {
+      "from": "now-3h",
+      "to": "now"
+    },
     "templating": {
       "list": [
         {
           "name": "tenant_id",
           "type": "query",
-          "datasource": { "type": "cloudwatch", "uid": "__CLOUDWATCH_DATASOURCE_UID__" },
-          "query": { "queryType": "dimensionValues", "namespace": "BedrockGateway", "metricName": "RequestCount", "dimensionKey": "tenant_id", "region": "us-east-1" },
+          "datasource": {
+            "type": "cloudwatch",
+            "uid": "__CLOUDWATCH_DATASOURCE_UID__"
+          },
+          "query": {
+            "queryType": "dimensionValues",
+            "namespace": "BedrockGateway",
+            "metricName": "RequestCount",
+            "dimensionKey": "tenant_id",
+            "region": "us-east-1"
+          },
           "refresh": 2,
           "includeAll": true,
           "multi": true,
-          "current": { "text": "All", "value": "$__all" }
+          "current": {
+            "text": "All",
+            "value": "$__all"
+          }
         }
       ]
     },
     "panels": [
-      { "id": 100, "type": "row", "title": "Global", "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 } },
       {
-        "id": 1, "type": "timeseries", "title": "Request volume (global)",
-        "gridPos": { "h": 7, "w": 8, "x": 0, "y": 1 },
-        "datasource": { "type": "cloudwatch", "uid": "__CLOUDWATCH_DATASOURCE_UID__" },
+        "id": 100,
+        "type": "row",
+        "title": "Global",
+        "gridPos": {
+          "h": 1,
+          "w": 24,
+          "x": 0,
+          "y": 0
+        }
+      },
+      {
+        "id": 1,
+        "type": "timeseries",
+        "title": "Request volume (global)",
+        "gridPos": {
+          "h": 7,
+          "w": 8,
+          "x": 0,
+          "y": 1
+        },
+        "datasource": {
+          "type": "cloudwatch",
+          "uid": "__CLOUDWATCH_DATASOURCE_UID__"
+        },
         "targets": [
-          { "refId": "A", "region": "us-east-1", "namespace": "BedrockGateway", "metricName": "RequestCount", "statistic": "Sum", "dimensions": { "environment": "dev" }, "period": "60" }
+          {
+            "refId": "A",
+            "region": "us-east-1",
+            "namespace": "BedrockGateway",
+            "metricName": "RequestCount",
+            "statistic": "Sum",
+            "dimensions": {
+              "environment": "dev"
+            },
+            "period": "60",
+            "queryMode": "Metrics",
+            "metricQueryType": 0,
+            "metricEditorMode": 0
+          }
         ]
       },
       {
-        "id": 2, "type": "timeseries", "title": "Error / reject rate (global, %)",
-        "gridPos": { "h": 7, "w": 8, "x": 8, "y": 1 },
-        "datasource": { "type": "cloudwatch", "uid": "__CLOUDWATCH_DATASOURCE_UID__" },
-        "fieldConfig": { "defaults": { "unit": "percent" }, "overrides": [] },
+        "id": 2,
+        "type": "timeseries",
+        "title": "Error / reject rate (global, %)",
+        "gridPos": {
+          "h": 7,
+          "w": 8,
+          "x": 8,
+          "y": 1
+        },
+        "datasource": {
+          "type": "cloudwatch",
+          "uid": "__CLOUDWATCH_DATASOURCE_UID__"
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "percent"
+          },
+          "overrides": []
+        },
         "targets": [
-          { "refId": "errors", "region": "us-east-1", "namespace": "BedrockGateway", "metricName": "ErrorCount", "statistic": "Sum", "dimensions": { "environment": "dev" }, "period": "60", "hide": true, "id": "errors" },
-          { "refId": "requests", "region": "us-east-1", "namespace": "BedrockGateway", "metricName": "RequestCount", "statistic": "Sum", "dimensions": { "environment": "dev" }, "period": "60", "hide": true, "id": "requests" },
-          { "refId": "rejects", "region": "us-east-1", "namespace": "BedrockGateway", "metricName": "RejectCount", "statistic": "Sum", "dimensions": { "environment": "dev" }, "period": "60", "hide": true, "id": "rejects" },
-          { "refId": "A", "region": "us-east-1", "namespace": "BedrockGateway", "expression": "100 * errors / requests", "period": "60", "id": "error_rate", "label": "Error rate %" },
-          { "refId": "B", "region": "us-east-1", "namespace": "BedrockGateway", "expression": "100 * rejects / requests", "period": "60", "id": "reject_rate", "label": "Reject rate %" }
+          {
+            "refId": "errors",
+            "region": "us-east-1",
+            "namespace": "BedrockGateway",
+            "metricName": "ErrorCount",
+            "statistic": "Sum",
+            "dimensions": {
+              "environment": "dev"
+            },
+            "period": "60",
+            "hide": true,
+            "id": "errors",
+            "queryMode": "Metrics",
+            "metricQueryType": 0,
+            "metricEditorMode": 0
+          },
+          {
+            "refId": "requests",
+            "region": "us-east-1",
+            "namespace": "BedrockGateway",
+            "metricName": "RequestCount",
+            "statistic": "Sum",
+            "dimensions": {
+              "environment": "dev"
+            },
+            "period": "60",
+            "hide": true,
+            "id": "requests",
+            "queryMode": "Metrics",
+            "metricQueryType": 0,
+            "metricEditorMode": 0
+          },
+          {
+            "refId": "rejects",
+            "region": "us-east-1",
+            "namespace": "BedrockGateway",
+            "metricName": "RejectCount",
+            "statistic": "Sum",
+            "dimensions": {
+              "environment": "dev"
+            },
+            "period": "60",
+            "hide": true,
+            "id": "rejects",
+            "queryMode": "Metrics",
+            "metricQueryType": 0,
+            "metricEditorMode": 0
+          },
+          {
+            "refId": "A",
+            "region": "us-east-1",
+            "namespace": "BedrockGateway",
+            "expression": "100 * errors / requests",
+            "period": "60",
+            "id": "error_rate",
+            "label": "Error rate %",
+            "queryMode": "Metrics",
+            "metricQueryType": 0,
+            "metricEditorMode": 1
+          },
+          {
+            "refId": "B",
+            "region": "us-east-1",
+            "namespace": "BedrockGateway",
+            "expression": "100 * rejects / requests",
+            "period": "60",
+            "id": "reject_rate",
+            "label": "Reject rate %",
+            "queryMode": "Metrics",
+            "metricQueryType": 0,
+            "metricEditorMode": 1
+          }
         ]
       },
       {
-        "id": 3, "type": "timeseries", "title": "Estimated cost (global, USD/5min)",
-        "gridPos": { "h": 7, "w": 8, "x": 16, "y": 1 },
-        "datasource": { "type": "cloudwatch", "uid": "__CLOUDWATCH_DATASOURCE_UID__" },
-        "fieldConfig": { "defaults": { "unit": "currencyUSD" }, "overrides": [] },
+        "id": 3,
+        "type": "timeseries",
+        "title": "Estimated cost (global, USD/5min)",
+        "gridPos": {
+          "h": 7,
+          "w": 8,
+          "x": 16,
+          "y": 1
+        },
+        "datasource": {
+          "type": "cloudwatch",
+          "uid": "__CLOUDWATCH_DATASOURCE_UID__"
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "currencyUSD"
+          },
+          "overrides": []
+        },
         "targets": [
-          { "refId": "A", "region": "us-east-1", "namespace": "BedrockGateway", "metricName": "EstimatedCostUsd", "statistic": "Sum", "dimensions": { "environment": "dev" }, "period": "300" }
+          {
+            "refId": "A",
+            "region": "us-east-1",
+            "namespace": "BedrockGateway",
+            "metricName": "EstimatedCostUsd",
+            "statistic": "Sum",
+            "dimensions": {
+              "environment": "dev"
+            },
+            "period": "300",
+            "queryMode": "Metrics",
+            "metricQueryType": 0,
+            "metricEditorMode": 0
+          }
         ]
       },
       {
-        "id": 4, "type": "timeseries", "title": "E2E latency (global, ms)",
-        "gridPos": { "h": 7, "w": 12, "x": 0, "y": 8 },
-        "datasource": { "type": "cloudwatch", "uid": "__CLOUDWATCH_DATASOURCE_UID__" },
-        "fieldConfig": { "defaults": { "unit": "ms" }, "overrides": [] },
+        "id": 4,
+        "type": "timeseries",
+        "title": "E2E latency (global, ms)",
+        "gridPos": {
+          "h": 7,
+          "w": 12,
+          "x": 0,
+          "y": 8
+        },
+        "datasource": {
+          "type": "cloudwatch",
+          "uid": "__CLOUDWATCH_DATASOURCE_UID__"
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "ms"
+          },
+          "overrides": []
+        },
         "targets": [
-          { "refId": "A", "region": "us-east-1", "namespace": "BedrockGateway", "metricName": "E2ELatencyMs", "statistic": "p50", "dimensions": { "environment": "dev" }, "period": "60", "label": "p50" },
-          { "refId": "B", "region": "us-east-1", "namespace": "BedrockGateway", "metricName": "E2ELatencyMs", "statistic": "p95", "dimensions": { "environment": "dev" }, "period": "60", "label": "p95" },
-          { "refId": "C", "region": "us-east-1", "namespace": "BedrockGateway", "metricName": "E2ELatencyMs", "statistic": "p99", "dimensions": { "environment": "dev" }, "period": "60", "label": "p99" }
+          {
+            "refId": "A",
+            "region": "us-east-1",
+            "namespace": "BedrockGateway",
+            "metricName": "E2ELatencyMs",
+            "statistic": "p50",
+            "dimensions": {
+              "environment": "dev"
+            },
+            "period": "60",
+            "label": "p50",
+            "queryMode": "Metrics",
+            "metricQueryType": 0,
+            "metricEditorMode": 0
+          },
+          {
+            "refId": "B",
+            "region": "us-east-1",
+            "namespace": "BedrockGateway",
+            "metricName": "E2ELatencyMs",
+            "statistic": "p95",
+            "dimensions": {
+              "environment": "dev"
+            },
+            "period": "60",
+            "label": "p95",
+            "queryMode": "Metrics",
+            "metricQueryType": 0,
+            "metricEditorMode": 0
+          },
+          {
+            "refId": "C",
+            "region": "us-east-1",
+            "namespace": "BedrockGateway",
+            "metricName": "E2ELatencyMs",
+            "statistic": "p99",
+            "dimensions": {
+              "environment": "dev"
+            },
+            "period": "60",
+            "label": "p99",
+            "queryMode": "Metrics",
+            "metricQueryType": 0,
+            "metricEditorMode": 0
+          }
         ]
       },
       {
-        "id": 5, "type": "timeseries", "title": "TTFT -- streaming only (global, ms)",
-        "gridPos": { "h": 7, "w": 12, "x": 12, "y": 8 },
-        "datasource": { "type": "cloudwatch", "uid": "__CLOUDWATCH_DATASOURCE_UID__" },
-        "fieldConfig": { "defaults": { "unit": "ms" }, "overrides": [] },
+        "id": 5,
+        "type": "timeseries",
+        "title": "TTFT -- streaming only (global, ms)",
+        "gridPos": {
+          "h": 7,
+          "w": 12,
+          "x": 12,
+          "y": 8
+        },
+        "datasource": {
+          "type": "cloudwatch",
+          "uid": "__CLOUDWATCH_DATASOURCE_UID__"
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "ms"
+          },
+          "overrides": []
+        },
         "targets": [
-          { "refId": "A", "region": "us-east-1", "namespace": "BedrockGateway", "metricName": "TTFTMs", "statistic": "p50", "dimensions": { "environment": "dev" }, "period": "60", "label": "p50" },
-          { "refId": "B", "region": "us-east-1", "namespace": "BedrockGateway", "metricName": "TTFTMs", "statistic": "p95", "dimensions": { "environment": "dev" }, "period": "60", "label": "p95" },
-          { "refId": "C", "region": "us-east-1", "namespace": "BedrockGateway", "metricName": "TTFTMs", "statistic": "p99", "dimensions": { "environment": "dev" }, "period": "60", "label": "p99" }
+          {
+            "refId": "A",
+            "region": "us-east-1",
+            "namespace": "BedrockGateway",
+            "metricName": "TTFTMs",
+            "statistic": "p50",
+            "dimensions": {
+              "environment": "dev"
+            },
+            "period": "60",
+            "label": "p50",
+            "queryMode": "Metrics",
+            "metricQueryType": 0,
+            "metricEditorMode": 0
+          },
+          {
+            "refId": "B",
+            "region": "us-east-1",
+            "namespace": "BedrockGateway",
+            "metricName": "TTFTMs",
+            "statistic": "p95",
+            "dimensions": {
+              "environment": "dev"
+            },
+            "period": "60",
+            "label": "p95",
+            "queryMode": "Metrics",
+            "metricQueryType": 0,
+            "metricEditorMode": 0
+          },
+          {
+            "refId": "C",
+            "region": "us-east-1",
+            "namespace": "BedrockGateway",
+            "metricName": "TTFTMs",
+            "statistic": "p99",
+            "dimensions": {
+              "environment": "dev"
+            },
+            "period": "60",
+            "label": "p99",
+            "queryMode": "Metrics",
+            "metricQueryType": 0,
+            "metricEditorMode": 0
+          }
         ]
       },
-      { "id": 101, "type": "row", "title": "Per-tenant (filter with the tenant_id variable, top-left)", "gridPos": { "h": 1, "w": 24, "x": 0, "y": 15 } },
       {
-        "id": 6, "type": "timeseries", "title": "E2E latency p95 by tenant (ms)",
-        "gridPos": { "h": 7, "w": 12, "x": 0, "y": 16 },
-        "datasource": { "type": "cloudwatch", "uid": "__CLOUDWATCH_DATASOURCE_UID__" },
-        "fieldConfig": { "defaults": { "unit": "ms" }, "overrides": [] },
+        "id": 101,
+        "type": "row",
+        "title": "Per-tenant (filter with the tenant_id variable, top-left)",
+        "gridPos": {
+          "h": 1,
+          "w": 24,
+          "x": 0,
+          "y": 15
+        }
+      },
+      {
+        "id": 6,
+        "type": "timeseries",
+        "title": "E2E latency p95 by tenant (ms)",
+        "gridPos": {
+          "h": 7,
+          "w": 12,
+          "x": 0,
+          "y": 16
+        },
+        "datasource": {
+          "type": "cloudwatch",
+          "uid": "__CLOUDWATCH_DATASOURCE_UID__"
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "ms"
+          },
+          "overrides": []
+        },
         "targets": [
-          { "refId": "A", "region": "us-east-1", "namespace": "BedrockGateway", "metricName": "E2ELatencyMs", "statistic": "p95", "dimensions": { "tenant_id": "$tenant_id" }, "period": "60", "matchExact": true }
+          {
+            "refId": "A",
+            "region": "us-east-1",
+            "namespace": "BedrockGateway",
+            "metricName": "E2ELatencyMs",
+            "statistic": "p95",
+            "dimensions": {
+              "tenant_id": "$tenant_id"
+            },
+            "period": "60",
+            "matchExact": true,
+            "queryMode": "Metrics",
+            "metricQueryType": 0,
+            "metricEditorMode": 0
+          }
         ]
       },
       {
-        "id": 7, "type": "timeseries", "title": "Request volume by tenant",
-        "gridPos": { "h": 7, "w": 12, "x": 12, "y": 16 },
-        "datasource": { "type": "cloudwatch", "uid": "__CLOUDWATCH_DATASOURCE_UID__" },
+        "id": 7,
+        "type": "timeseries",
+        "title": "Request volume by tenant",
+        "gridPos": {
+          "h": 7,
+          "w": 12,
+          "x": 12,
+          "y": 16
+        },
+        "datasource": {
+          "type": "cloudwatch",
+          "uid": "__CLOUDWATCH_DATASOURCE_UID__"
+        },
         "targets": [
-          { "refId": "A", "region": "us-east-1", "namespace": "BedrockGateway", "metricName": "RequestCount", "statistic": "Sum", "dimensions": { "tenant_id": "$tenant_id" }, "period": "60", "matchExact": true }
+          {
+            "refId": "A",
+            "region": "us-east-1",
+            "namespace": "BedrockGateway",
+            "metricName": "RequestCount",
+            "statistic": "Sum",
+            "dimensions": {
+              "tenant_id": "$tenant_id"
+            },
+            "period": "60",
+            "matchExact": true,
+            "queryMode": "Metrics",
+            "metricQueryType": 0,
+            "metricEditorMode": 0
+          }
         ]
       },
       {
-        "id": 8, "type": "timeseries", "title": "Cost by tenant (USD/5min)",
-        "gridPos": { "h": 7, "w": 12, "x": 0, "y": 23 },
-        "datasource": { "type": "cloudwatch", "uid": "__CLOUDWATCH_DATASOURCE_UID__" },
-        "fieldConfig": { "defaults": { "unit": "currencyUSD" }, "overrides": [] },
+        "id": 8,
+        "type": "timeseries",
+        "title": "Cost by tenant (USD/5min)",
+        "gridPos": {
+          "h": 7,
+          "w": 12,
+          "x": 0,
+          "y": 23
+        },
+        "datasource": {
+          "type": "cloudwatch",
+          "uid": "__CLOUDWATCH_DATASOURCE_UID__"
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "currencyUSD"
+          },
+          "overrides": []
+        },
         "targets": [
-          { "refId": "A", "region": "us-east-1", "namespace": "BedrockGateway", "metricName": "EstimatedCostUsd", "statistic": "Sum", "dimensions": { "tenant_id": "$tenant_id" }, "period": "300", "matchExact": true }
+          {
+            "refId": "A",
+            "region": "us-east-1",
+            "namespace": "BedrockGateway",
+            "metricName": "EstimatedCostUsd",
+            "statistic": "Sum",
+            "dimensions": {
+              "tenant_id": "$tenant_id"
+            },
+            "period": "300",
+            "matchExact": true,
+            "queryMode": "Metrics",
+            "metricQueryType": 0,
+            "metricEditorMode": 0
+          }
         ]
       },
       {
-        "id": 9, "type": "timeseries", "title": "TTFT p95 by tenant -- streaming only (ms)",
-        "gridPos": { "h": 7, "w": 12, "x": 12, "y": 23 },
-        "datasource": { "type": "cloudwatch", "uid": "__CLOUDWATCH_DATASOURCE_UID__" },
-        "fieldConfig": { "defaults": { "unit": "ms" }, "overrides": [] },
+        "id": 9,
+        "type": "timeseries",
+        "title": "TTFT p95 by tenant -- streaming only (ms)",
+        "gridPos": {
+          "h": 7,
+          "w": 12,
+          "x": 12,
+          "y": 23
+        },
+        "datasource": {
+          "type": "cloudwatch",
+          "uid": "__CLOUDWATCH_DATASOURCE_UID__"
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "ms"
+          },
+          "overrides": []
+        },
         "targets": [
-          { "refId": "A", "region": "us-east-1", "namespace": "BedrockGateway", "metricName": "TTFTMs", "statistic": "p95", "dimensions": { "tenant_id": "$tenant_id" }, "period": "60", "matchExact": true }
+          {
+            "refId": "A",
+            "region": "us-east-1",
+            "namespace": "BedrockGateway",
+            "metricName": "TTFTMs",
+            "statistic": "p95",
+            "dimensions": {
+              "tenant_id": "$tenant_id"
+            },
+            "period": "60",
+            "matchExact": true,
+            "queryMode": "Metrics",
+            "metricQueryType": 0,
+            "metricEditorMode": 0
+          }
         ]
       }
     ]

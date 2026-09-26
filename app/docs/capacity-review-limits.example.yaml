@@ -1,0 +1,30 @@
+# Snapshot of this gateway's current limits, the input to
+# scripts/capacity_review.py. Hand-maintained or exported; the review
+# never reads or writes the live gateway config itself.
+#
+# Values below are the gateway's documented defaults / dev quota rows,
+# for illustration only; replace with the real deployment's.
+
+concurrency:
+  global_max: 32          # CONCURRENCY_GLOBAL_MAX (per gateway process, all models)
+  default_tenant_max: 8   # CONCURRENCY_DEFAULT_TENANT_MAX
+  processes: 1            # running gateway tasks/processes sharing Bedrock quota
+
+models:                   # gateway-model-quotas-dev quota#<model_id> rows
+  us.amazon.nova-micro-v1:0:
+    rpm_limit: 400
+    tpm_limit: 8000000
+  us.amazon.nova-pro-v1:0:
+    rpm_limit: 50
+    tpm_limit: 2000000
+  us.meta.llama3-3-70b-instruct-v1:0:
+    rpm_limit: 80
+    tpm_limit: 600000
+
+tenants:                  # tenant policies (rpm_limit + allowed models)
+  tenant1-finance:
+    rpm_limit: 300
+    models: [us.amazon.nova-micro-v1:0, us.amazon.nova-pro-v1:0, us.meta.llama3-3-70b-instruct-v1:0]
+  tenant2-search:
+    rpm_limit: 120
+    models: [us.amazon.nova-micro-v1:0, us.amazon.nova-pro-v1:0, us.meta.llama3-3-70b-instruct-v1:0]

@@ -149,6 +149,28 @@ installs a no-op global tracer before any test imports `create_app()`, so
 you won't see the console span exporter's output during the suite. Run
 the server for real (`python -m services.gateway.main`) to see it.
 
+## Capacity review (bedrock-runtime-benchmark profiles)
+
+`bedrock-runtime-benchmark` measures each model's Bedrock operating
+envelope and publishes it as `capacity-profile.yaml` -- a contract it
+produces without knowing this gateway's config. Mapping that envelope
+onto gateway knobs happens here:
+
+```bash
+python scripts/capacity_review.py \
+    --gateway-config docs/capacity-review-limits.example.yaml \
+    ../../bedrock-runtime-benchmark/results/run-all-<ts>/*/*-capacity-profile.yaml
+```
+
+It compares each profile's `recommendation.admission_envelope`
+(`sustained_rps`, `max_inflight` -- statistically confirmed, after the
+benchmark's headroom) against a snapshot of this gateway's limits
+(model `rpm_limit`, tenant `rpm_limit`, `CONCURRENCY_DEFAULT_TENANT_MAX`,
+`CONCURRENCY_GLOBAL_MAX`) and prints YAML findings, exiting 1 on any
+warn. Read-only: it proposes, the config review decides. A profile with
+no confirmed envelope (`admission_envelope: null`) proposes nothing.
+See `services/gateway/capacity_review.py`.
+
 ## Load / chaos testing (M6)
 
 ```bash
@@ -234,6 +256,8 @@ scripts/
                                      # platform-policy-definitions checkout -- not run by CI
   migrate_file_tenants_to_dynamodb.py  # dry-run-by-default backfill of policies/tenants.yaml
                                         # into DynamoDbPolicyStore, idempotent
+  capacity_review.py                # compare bedrock-runtime-benchmark capacity profiles
+                                     # against a snapshot of this gateway's limits
 policies/
   tenants.yaml            # COPY -- canonical source is platform-policy-definitions
   route_sets.yaml         # COPY -- ditto

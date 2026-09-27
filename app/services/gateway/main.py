@@ -117,6 +117,9 @@ def create_app(
             region=settings.aws_region,
             timeout_s=settings.bedrock_timeout_s,
             max_retries=settings.bedrock_max_retries,
+            base_backoff_s=settings.bedrock_base_backoff_s,
+            max_backoff_s=settings.bedrock_max_backoff_s,
+            total_retry_budget_s=settings.bedrock_retry_budget_s,
         )
     if token_verifier is None:
         token_verifier = _build_default_token_verifier(settings)

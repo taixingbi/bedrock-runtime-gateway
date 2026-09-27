@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from typing import Optional
 
 
 def _env_float(name: str, default: float) -> float:
@@ -16,6 +17,11 @@ def _env_float(name: str, default: float) -> float:
     if raw is None or raw == "":
         return default
     return float(raw)
+
+
+def _env_optional_float(name: str) -> Optional[float]:
+    raw = os.environ.get(name)
+    return None if raw is None or raw == "" else float(raw)
 
 
 def _env_int(name: str, default: int) -> int:
@@ -32,6 +38,11 @@ class Settings:
     bedrock_model_id: str
     bedrock_timeout_s: float
     bedrock_max_retries: int
+    # Retry backoff (BedrockClient): base, optional cap per sleep, and an
+    # optional total budget per call. None = no cap / no budget.
+    bedrock_base_backoff_s: float
+    bedrock_max_backoff_s: Optional[float]
+    bedrock_retry_budget_s: Optional[float]
 
     # HTTP server
     host: str
@@ -262,6 +273,9 @@ def load_settings() -> Settings:
         ),
         bedrock_timeout_s=_env_float("BEDROCK_TIMEOUT_S", 30.0),
         bedrock_max_retries=_env_int("BEDROCK_MAX_RETRIES", 2),
+        bedrock_base_backoff_s=_env_float("BEDROCK_BASE_BACKOFF_S", 0.25),
+        bedrock_max_backoff_s=_env_optional_float("BEDROCK_MAX_BACKOFF_S"),
+        bedrock_retry_budget_s=_env_optional_float("BEDROCK_RETRY_BUDGET_S"),
         host=os.environ.get("GATEWAY_HOST", "0.0.0.0"),
         port=_env_int("GATEWAY_PORT", 8080),
         service_name=os.environ.get("SERVICE_NAME", "gateway-api"),

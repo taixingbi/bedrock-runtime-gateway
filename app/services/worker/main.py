@@ -85,6 +85,9 @@ def main() -> None:
         region=settings.aws_region,
         timeout_s=settings.bedrock_timeout_s,
         max_retries=settings.bedrock_max_retries,
+        base_backoff_s=settings.bedrock_base_backoff_s,
+        max_backoff_s=settings.bedrock_max_backoff_s,
+        total_retry_budget_s=settings.bedrock_retry_budget_s,
     )
     circuit_breaker = CircuitBreaker(
         failure_threshold=settings.circuit_breaker_failure_threshold,

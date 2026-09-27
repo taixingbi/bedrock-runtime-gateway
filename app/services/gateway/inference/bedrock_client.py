@@ -114,7 +114,19 @@ class BedrockClient:
         timeout_s: float = 30.0,
         max_retries: int = 2,
         base_backoff_s: float = 0.25,
+        max_backoff_s: Optional[float] = None,
+        total_retry_budget_s: Optional[float] = None,
     ):
+        """Retry k (k = 1 for the first retry) sleeps uniform(0, cap) with
+        cap = base_backoff_s x 2^(k-1), capped at max_backoff_s when set
+        (full jitter). A retry whose sleep would take the call past
+        total_retry_budget_s (measured from the first attempt) is not
+        made -- the call fails with the last error instead. Both None =
+        no cap / no budget (the original behaviour)."""
+        if max_backoff_s is not None and max_backoff_s <= 0:
+            raise ValueError(f"max_backoff_s must be > 0, got {max_backoff_s}")
+        if total_retry_budget_s is not None and total_retry_budget_s <= 0:
+            raise ValueError(f"total_retry_budget_s must be > 0, got {total_retry_budget_s}")
         try:
             import boto3
             from botocore.config import Config as BotoConfig
@@ -126,6 +138,8 @@ class BedrockClient:
 
         self._max_retries = max_retries
         self._base_backoff_s = base_backoff_s
+        self._max_backoff_s = max_backoff_s
+        self._total_retry_budget_s = total_retry_budget_s
         self._client = boto3.client(
             "bedrock-runtime",
             region_name=region,
@@ -182,8 +196,19 @@ class BedrockClient:
                         retryable=retryable,
                     ) from exc
                 # bounded exponential backoff + full jitter (section 15/16 of the plan)
-                sleep_s = self._base_backoff_s * (2 ** (attempt - 1))
-                time.sleep(random.uniform(0, sleep_s))
+                cap_s = self._base_backoff_s * (2 ** (attempt - 1))
+                if self._max_backoff_s is not None:
+                    cap_s = min(cap_s, self._max_backoff_s)
+                sleep_s = random.uniform(0, cap_s)
+                if (self._total_retry_budget_s is not None
+                        and time.perf_counter() - start + sleep_s > self._total_retry_budget_s):
+                    raise BedrockInvocationError(
+                        f"Bedrock invocation failed after {attempt} attempt(s), retry budget "
+                        f"{self._total_retry_budget_s}s exhausted: {exc}",
+                        code=error_code or "UPSTREAM_ERROR",
+                        retryable=retryable,
+                    ) from exc
+                time.sleep(sleep_s)
 
     def converse_stream(
         self,

@@ -165,6 +165,12 @@ class AdmissionEnvelopeContractTests(unittest.TestCase):
         result = diff([profile], {"models": {MODEL: {"rpm_limit": 400}}})
         self.assertEqual([f.kind for f in result.findings], ["characterization_profile_skipped"])
 
+    def test_admission_calibration_profiles_are_skipped(self):
+        profile = self._v11()
+        profile.update(schema_version=15, purpose="admission_calibration")
+        result = diff([profile], {"models": {MODEL: {"rpm_limit": 400}}})
+        self.assertEqual([f.kind for f in result.findings], ["admission_calibration_profile_skipped"])
+
     def test_v12_reference_profiles_are_reviewed(self):
         profile = self._v11(rate_envelope={"sustained_rps": 5.3334, "max_inflight": None})
         profile.update(schema_version=12, purpose="reference")

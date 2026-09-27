@@ -159,6 +159,18 @@ class GatewayDiffTests(unittest.TestCase):
 class AdmissionEnvelopeContractTests(unittest.TestCase):
     """v11+: the benchmark's recommendation.admission_envelope."""
 
+    def test_characterization_profiles_are_skipped(self):
+        profile = self._v11()
+        profile.update(schema_version=12, purpose="characterization")
+        result = diff([profile], {"models": {MODEL: {"rpm_limit": 400}}})
+        self.assertEqual([f.kind for f in result.findings], ["characterization_profile_skipped"])
+
+    def test_v12_reference_profiles_are_reviewed(self):
+        profile = self._v11(rate_envelope={"sustained_rps": 5.3334, "max_inflight": None})
+        profile.update(schema_version=12, purpose="reference")
+        result = diff([profile], {"models": {MODEL: {"rpm_limit": 400}}})
+        self.assertIn("model_rpm_above_envelope", [f.kind for f in result.findings])
+
     def _v11(self, rate_envelope=None, conc_envelope=None):
         classes = {}
         classes["short_chat"] = {

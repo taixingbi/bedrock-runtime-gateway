@@ -41,7 +41,7 @@ import math
 from dataclasses import asdict, dataclass, field
 from typing import Dict, Iterable, List, Optional, Tuple
 
-SUPPORTED_SCHEMA_VERSIONS = {3, 4, 5, 6, 7, 8, 9, 10, 11}
+SUPPORTED_SCHEMA_VERSIONS = {3, 4, 5, 6, 7, 8, 9, 10, 11, 12}
 
 
 @dataclass
@@ -185,6 +185,14 @@ def diff(profiles: List[dict], gateway: dict) -> GatewayDiff:
         version = profile.get("schema_version")
         if version not in SUPPORTED_SCHEMA_VERSIONS:
             raise ValueError(f"capacity profile schema_version {version} unsupported (need {sorted(SUPPORTED_SCHEMA_VERSIONS)})")
+        if profile.get("purpose") == "characterization":
+            # v12+: a characterization run studies token / context effects
+            # and never carries an admission envelope -- nothing to review.
+            out.findings.append(Finding(
+                "info", "characterization_profile_skipped", profile["model"]["model_id"],
+                f"{profile.get('experiment')}: characterization experiment -- no admission envelope to review",
+            ))
+            continue
         by_model.setdefault(profile["model"]["model_id"], []).append(profile)
 
     gw_models = gateway.get("models") or {}

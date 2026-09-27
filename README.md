@@ -1,4 +1,4 @@
-# bedrock-runtime-gateway
+# eval-bedrock-gateway
 
 The Bedrock inference data plane: `gateway-api` + the M7 worker
 (`app/`), and every piece of Terraform they run on (`infra/`) — ECS/
@@ -38,7 +38,7 @@ edits.
 See `app/README.md` and `infra/README.md` for the full detail on each
 half. This repo is one of six in the platform:
 
-- **bedrock-runtime-gateway** (this repo) — inference data plane.
+- **eval-bedrock-gateway** (this repo) — inference data plane.
 - [platform-edge-gateway](https://github.com/taixingbi/platform-edge-gateway) — ingress: API Gateway, SigV4/AuthN, VPC Link, global throttling.
 - [platform-authz-service](https://github.com/taixingbi/platform-authz-service) — AuthZ decision service (RBAC/ABAC).
 - [platform-control-plane](https://github.com/taixingbi/platform-control-plane) — admin + onboarding + portal.

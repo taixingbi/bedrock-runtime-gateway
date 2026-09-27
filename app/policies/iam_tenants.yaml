@@ -32,7 +32,7 @@
 # the two *exact*-role-ARN entries that used to live here are actually
 # redundant with DynamoDB (gateway-principal-grants-dev) -- both
 # DynamoDbIamTenantResolver implementations in this platform
-# (bedrock-runtime-gateway's auth/aws_iam.py and this repo's sibling
+# (eval-bedrock-gateway's auth/aws_iam.py and this repo's sibling
 # platform-authz-service/attributes/resolver.py) do an exact-match
 # get_item() only, by deliberate design (see aws_iam.py's own
 # docstring: "the '*' session-name-wildcard case ... only makes sense

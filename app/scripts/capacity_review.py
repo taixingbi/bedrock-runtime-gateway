@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Review bedrock-runtime-benchmark capacity profiles against a snapshot
+"""Review eval-bedrock-runtime-benchmark capacity profiles against a snapshot
 of this gateway's limits (see services/gateway/capacity_review.py):
 
     python scripts/capacity_review.py \\
         --gateway-config docs/capacity-review-limits.example.yaml \\
-        ../../bedrock-runtime-benchmark/results/run-all-<ts>/*/*-capacity-profile.yaml
+        ../../eval-bedrock-runtime-benchmark/results/run-all-<ts>/*/*-capacity-profile.yaml
 
 Prints the findings as YAML (warn first). Exits 1 when any warn-level
 finding exists, so it can gate a config review. Read-only: it never

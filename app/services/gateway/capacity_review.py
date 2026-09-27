@@ -1,5 +1,5 @@
 """Capacity review -- the gateway-side CONSUMER of
-bedrock-runtime-benchmark's capacity-profile.yaml contract.
+eval-bedrock-runtime-benchmark's capacity-profile.yaml contract.
 
 The benchmark produces a measured, statistically confirmed envelope per
 model x workload (`recommendation.admission_envelope`: max_inflight /

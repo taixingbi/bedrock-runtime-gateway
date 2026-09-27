@@ -395,7 +395,7 @@ module "github_oidc_app" {
   # included, only ever references it via data source.
   create_oidc_provider = false
   github_org           = var.github_org
-  github_repo          = "bedrock-runtime-gateway"
+  github_repo          = "eval-bedrock-gateway"
 
   roles = {
     dev = {
@@ -414,7 +414,7 @@ module "github_oidc_infra" {
 
   create_oidc_provider = false
   github_org           = var.github_org
-  github_repo          = "bedrock-runtime-gateway"
+  github_repo          = "eval-bedrock-gateway"
 
   roles = {
     plan = {

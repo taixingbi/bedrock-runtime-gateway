@@ -1,4 +1,4 @@
-# bedrock-runtime-gateway / infra
+# eval-bedrock-gateway / infra
 
 Terraform for everything the `app/` half of this repo (and its
 sibling services in other repos) run on: VPC/networking (private

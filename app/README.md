@@ -1,4 +1,4 @@
-# bedrock-runtime-gateway / app
+# eval-bedrock-gateway / app
 
 Multi-tenant Enterprise LLM Gateway on AWS Bedrock — the application
 code, and the core of a production-shaped enterprise AI platform, not
@@ -23,7 +23,7 @@ below covers everything real since then.
 
 ## This repo vs. the platform's other repos
 
-This is the `app/` half of `bedrock-runtime-gateway` -- see the
+This is the `app/` half of `eval-bedrock-gateway` -- see the
 [top-level README](../README.md) for why app/ and infra/ live in one
 repo again (they were briefly split, 2026-09-20/21). The platform's
 other repos:
@@ -149,9 +149,9 @@ installs a no-op global tracer before any test imports `create_app()`, so
 you won't see the console span exporter's output during the suite. Run
 the server for real (`python -m services.gateway.main`) to see it.
 
-## Capacity review (bedrock-runtime-benchmark profiles)
+## Capacity review (eval-bedrock-runtime-benchmark profiles)
 
-`bedrock-runtime-benchmark` measures each model's Bedrock operating
+`eval-bedrock-runtime-benchmark` measures each model's Bedrock operating
 envelope and publishes it as `capacity-profile.yaml` -- a contract it
 produces without knowing this gateway's config. Mapping that envelope
 onto gateway knobs happens here:
@@ -159,7 +159,7 @@ onto gateway knobs happens here:
 ```bash
 python scripts/capacity_review.py \
     --gateway-config docs/capacity-review-limits.example.yaml \
-    ../../bedrock-runtime-benchmark/results/run-all-<ts>/*/*-capacity-profile.yaml
+    ../../eval-bedrock-runtime-benchmark/results/run-all-<ts>/*/*-capacity-profile.yaml
 ```
 
 It compares each profile's `recommendation.admission_envelope`
@@ -256,7 +256,7 @@ scripts/
                                      # platform-policy-definitions checkout -- not run by CI
   migrate_file_tenants_to_dynamodb.py  # dry-run-by-default backfill of policies/tenants.yaml
                                         # into DynamoDbPolicyStore, idempotent
-  capacity_review.py                # compare bedrock-runtime-benchmark capacity profiles
+  capacity_review.py                # compare eval-bedrock-runtime-benchmark capacity profiles
                                      # against a snapshot of this gateway's limits
 policies/
   tenants.yaml            # COPY -- canonical source is platform-policy-definitions

@@ -1,5 +1,5 @@
 """services/gateway/capacity_review.py -- the gateway-side consumer of
-bedrock-runtime-benchmark's capacity-profile.yaml contract (moved here
+eval-bedrock-runtime-benchmark's capacity-profile.yaml contract (moved here
 from the benchmark repo, which no longer knows this gateway's config
 schema)."""
 import contextlib
